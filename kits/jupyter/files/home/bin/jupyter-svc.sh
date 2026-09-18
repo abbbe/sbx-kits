@@ -45,6 +45,26 @@ TOKEN=$(cat "$TOKEN_FILE")
 # terminal would open there while kernels open in the workspace mount.
 cd "$ROOT" || exit 1
 
+# BASH, NOT sh, IN JUPYTERLAB TERMINALS.  jupyter_server_terminals picks the
+# shell with `[os.environ.get("SHELL") or which("sh")]` -- it never reads the
+# user's passwd entry, so `agent` having /bin/bash there buys nothing.  This
+# script is launched by sbx's detached startup dispatcher, which exports no
+# SHELL, so the fallback wins and every terminal opens /bin/sh.  Both lines
+# below are wanted; they fix different halves:
+#
+#   - terminado_settings pins what the server spawns, independently of the
+#     environment this script happened to be started with;
+#   - SHELL is inherited by that shell and by its children, so $SHELL inside
+#     the terminal is right too (bash does not set it -- login(1) normally
+#     would), which is what anything spawning "the user's shell" consults.
+#
+# An explicit shell_command suppresses upstream's own `-l` append (it only adds
+# that when it had to guess the shell AND stdout is not a tty, both true here),
+# so `-l` is spelled out to keep that behaviour: a login shell sources
+# /etc/profile and ~/.profile, which is where the PATH that finds `claude`
+# comes from.
+export SHELL=/bin/bash
+
 delay=1
 while true; do
     start=$SECONDS
@@ -60,6 +80,7 @@ while true; do
         --IdentityProvider.token="$TOKEN" \
         --ServerApp.root_dir="$ROOT" \
         --ServerApp.allow_remote_access=True \
+        --ServerApp.terminado_settings="{'shell_command': ['/bin/bash', '-l']}" \
         --ServerApp.jpserver_extensions="{'jupyter_mcp_server': False}" \
         --SQLiteYStore.db_path="$RTC/ystore.db" \
         --YDocExtension.session_store_path="$RTC/collaboration_sessions.json"

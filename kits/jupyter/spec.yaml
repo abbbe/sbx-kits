@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: mixin
 name: sbx-jupyter
-version: "0.3.0"
+version: "0.3.1"
 displayName: JupyterLab + MCP
 description: JupyterLab with RTC, and jupyter-mcp-server over stdio in MCP_SERVER mode.
 requires:
