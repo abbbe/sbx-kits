@@ -1,0 +1,12 @@
+# Burp in the desktop's Applications menu. A fragment, not a whole menu: the
+# outer [begin]/[end] and the Applications submenu belong to kits/desktop, which
+# parses every file in this directory. Nothing breaks when the desktop kit is
+# absent -- there is then no fluxbox to read it.
+#
+# WRAPPED IN xterm ON PURPOSE.  burp-start.sh's first run against a fresh state
+# directory is a console conversation -- Burp prints the EULA and blocks on
+# stdin -- and a menu [exec] has no terminal, so a bare entry would exit 1 into
+# nowhere and read as "the menu item does nothing". -hold keeps the window after
+# the script returns, which is also how the "proxy :8080 mcp api :8081" summary
+# and any staging error stay readable. Later starts just print and detach.
+[exec] (Burp Suite Pro) {xterm -hold -T "burp-start" -e /home/agent/bin/burp-start.sh}

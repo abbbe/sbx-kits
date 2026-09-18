@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: mixin
 name: sbx-desktop
-version: "0.1.0"
+version: "0.2.0"
 displayName: Virtual desktop (TigerVNC + noVNC)
 description: >-
   A resizable X display, a window manager, and noVNC in front of it. The desktop
@@ -149,6 +149,10 @@ setup:
         set -e
         install -d -o agent -g agent -m 0755 /home/agent/.local /home/agent/.local/state
         install -d -o agent -g agent -m 0700 /home/agent/.local/state/desktop
+        # menu.d must exist even when nothing contributes to it: ~/.fluxbox/menu
+        # includes it unconditionally, and fluxbox parsing a missing include is
+        # a silently emptier menu rather than an error anyone would notice.
+        install -d -o agent -g agent -m 0755 /home/agent/.fluxbox/menu.d
         chown -R agent:agent /home/agent/bin /home/agent/.fluxbox
         chmod +x /home/agent/bin/desktop-svc.sh /home/agent/bin/desktopctl
 

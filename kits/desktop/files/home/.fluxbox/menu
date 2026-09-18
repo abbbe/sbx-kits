@@ -1,0 +1,39 @@
+# Fluxbox root menu (right-click the desktop).
+#
+# SHIPPING THIS FILE IS WHAT MAKES menu.d POSSIBLE.  Left absent, fluxbox
+# generates ~/.fluxbox/menu on first start as a bare include of Debian's
+# auto-generated /etc/X11/fluxbox/fluxbox-menu -- which no other kit can add an
+# entry to, because it is regenerated from installed packages and carries its
+# own [begin]/[end].  Owning the outer menu here turns "add an application" into
+# "drop a file in menu.d", which is how kits/burp puts Burp in this menu without
+# either kit knowing about the other.
+#
+# [include] TAKES A DIRECTORY, not just a file: every file in menu.d is parsed,
+# in alphabetical order, so fragments are named NN-thing to make that order
+# explicit.  The directory is created by this kit's install hook so the include
+# still resolves when no kit has contributed anything.
+#
+# Debian's generated menu is kept, one level down under Applications -> Debian.
+# It is mostly Bc and three shells, but it is also where anything apt-installed
+# later shows up on its own, and losing that silently would be worse than the
+# extra click.  menudefs.hook is the FRAGMENT form of that menu (no [begin] of
+# its own), which is why it can be nested at all; fluxbox-menu cannot.
+[begin] (sbx)
+  [submenu] (Applications) {}
+    [include] (/home/agent/.fluxbox/menu.d)
+    [separator]
+    [exec] (Terminal) {xterm -T "Terminal" -e /bin/bash --login}
+    [submenu] (Debian) {}
+      [include] (/etc/X11/fluxbox/menudefs.hook)
+    [end]
+  [end]
+  [separator]
+  [workspaces] (Workspaces)
+  [submenu] (Styles) {}
+    [stylesdir] (/usr/share/fluxbox/styles)
+  [end]
+  [config] (Configuration)
+  [reconfig] (Reconfigure)
+  [restart] (Restart fluxbox)
+  [exit] (Exit)
+[end]
