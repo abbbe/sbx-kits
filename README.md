@@ -9,7 +9,7 @@ JupyterLab is there for scripting.
 |---|---|---|---|
 | [`kits/jupyter`](kits/jupyter) | JupyterLab with RTC + `jupyter-mcp-server` over stdio | 8888 | automatically |
 | [`kits/desktop`](kits/desktop) | TigerVNC (Xvnc) + fluxbox + noVNC, resizes to the browser | 6080 | automatically |
-| [`kits/burp`](kits/burp) | Burp Suite Pro + [`burp-mcp-bridge`](https://github.com/fwaeytens/burp-mcp-bridge) | 8080 | on demand |
+| [`kits/burp`](kits/burp) | Burp Suite Pro + a Burp MCP server ([`burp-mcp-bridge`](https://github.com/fwaeytens/burp-mcp-bridge) by default) | 8080 | on demand |
 
 Kits are composed at **create** time — `sbx kit add` on a running sandbox silently skips
 `ports:` and `volumes:`, so a kit added later has nothing published.
@@ -42,7 +42,7 @@ create with a 409.
 
 ## Everything, including Burp
 
-Burp Pro and the MCP bridge are staged on the host and mounted in — PortSwigger's download
+Burp Pro and the Burp MCP server are staged on the host and mounted in — PortSwigger's download
 needs your account, so nothing here can fetch Burp for you. Download the **platform installer**
 matching your machine's architecture (`Linux (ARM)` on Apple Silicon, `Linux (x64)` on Intel)
 from <https://portswigger.net/burp/releases/>, then:
@@ -133,6 +133,91 @@ JupyterLab uses it as its access token and the desktop as its VNC password. Note
 protocol truncates VNC passwords to **eight characters**, so the desktop is only ever protected
 by the first eight — which is why 6080 belongs on `127.0.0.1` and nowhere else. One token also
 means one leak exposes both services.
+
+## Running a fork of the Jupyter MCP server
+
+`kits/jupyter` installs `jupyter-mcp-server` from PyPI. The kit arg `jupyter_mcp_pkg` is whatever
+`uv pip install` is handed, so a fork — or a pinned release — is one flag away:
+
+```console
+sbx-kits up --jupyter-mcp-pkg git+https://github.com/abbbe/jupyter-mcp-server@ca5973738b6ee5a0bfd7357697297dc78a782318
+sbx-kits up --jupyter-mcp-pkg jupyter-mcp-server==2.1.12    # or just pin PyPI
+```
+
+A fork you are living on is not a per-invocation decision, so
+`JUPYTER_MCP_PKG=git+https://…@<sha>` in `~/.config/sbx-kits/config` is usually the better home for it.
+The wrapper flag exists because `sbx-kits` rejects arguments it does not know; underneath it
+becomes `--kit-arg sbx-jupyter.jupyter_mcp_pkg=…`, namespaced because only that kit declares it.
+
+Pin a **commit SHA**, not a branch: `@main` reinstalls whatever that branch points at on the day
+you rebuild, which is not a pin. Use `git+https` and not the SSH remote — the container holds no
+key, and a public fork does not need one. `uv` shells out to a real git, which the base agent
+image already provides, so nothing else has to be installed.
+
+Neither spelling reaches egress, though. `permissions.network.allow` is static and read at create
+time, so `github.com:443` is listed unconditionally even though the default value never goes
+there; a fork hosted anywhere else needs that file edited as well.
+
+## Running a fork of the Burp MCP server
+
+The Burp MCP server is two halves: an extension jar that publishes a JSON-RPC API on
+127.0.0.1:8081 inside Burp, and a Node process that speaks MCP over stdio and calls it. They
+arrive by different routes, and that is the one thing to keep straight.
+
+The **node half is installed in the sandbox at create**, not staged — so npm resolves its ~90
+transitive packages under the sandbox's own egress policy, where a dependency reaching somewhere
+unexpected is a denied connection in `sbx policy log` rather than silent traffic from your laptop.
+Nothing builds a `node_modules` tree on the host for a platform it is not running on, and
+`stage-burp.sh` no longer needs `node` or `npm` at all.
+
+The **extension jar is still staged**, because Burp loads extensions from a file path and nothing
+in the sandbox builds Java.
+
+So a fork is two coordinates that have to agree:
+
+```console
+./kits/burp/stage-burp.sh --installer … --burp-mcp-src you/burp-mcp-bridge@v2.8.0
+./bin/sbx-kits up        --burp-mcp-src you/burp-mcp-bridge@v2.8.0
+```
+
+`stage-burp.sh` records what it staged, the kit records what it installed, and `burp-mcp.sh`
+warns on stderr when the two disagree — the halves are versioned together and nothing else makes
+them match. A ref with no release behind it yields no jar, so build it yourself and hand it over:
+
+```console
+mvn -f extension/pom.xml package
+./kits/burp/stage-burp.sh --installer … --burp-mcp-src you/burp-mcp-bridge@my-branch \
+    --burp-mcp-jar ~/github/burp-mcp-bridge/extension/target/burp-mcp-bridge-2.8.0.jar
+```
+
+### When upstream publishes to npm
+
+`--burp-mcp-pkg` takes an npm install spec and wins over `--burp-mcp-src`, which is the better
+setting the day it exists — a registry coordinate, exactly like the jupyter kit's
+`--jupyter-mcp-pkg`, and `github.com:443` plus `codeload.github.com:443` can then leave this kit's
+allowlist. It is empty today only because `burp-mcp-bridge` is not on npm. Note that npm has no
+equivalent of pip's `#subdirectory=`, and upstream keeps `package.json` in `bridge/` rather than at
+the repo root, so a `git+https` URL cannot work here the way it does for the Jupyter kit — a fork
+is selected by version or by a scoped package name, not by commit SHA.
+
+### Swapping in a different MCP server
+
+A different implementation, rather than a fork of this one, is a bigger job, but the kit no longer
+fights you on three of the pieces:
+
+- **The extension is a drop-in.** `files/home/etc/burp/extensions.d/*.json` is merged into Burp's
+  extension list when the user config is first seeded, `@BURP_DIST@` expanded as in the seed.
+  Add a `.json`, get an extension; the seed itself names none.
+- **Nothing blocks on the MCP port.** `burp-start.sh` waits only for the proxy. The MCP API gets a
+  bounded advisory probe — `BURP_MCP_WAIT` seconds, default 30, and `BURP_MCP_WAIT=0` for a server
+  that binds no TCP port at all.
+- **`BURP_API_PORT` now sets the port on both sides**, exported to Burp as `BURP_MCP_SERVER_PORT`
+  for the extension to read. It used to configure only the clients while the extension bound its
+  own default, so any value but 8081 broke the pairing silently.
+
+What remains specific to upstream: the `bridge/` source layout, and `MCP_TRANSPORT_MODE` /
+`BURP_MCP_SERVER_PORT` as the env-var spellings that select stdio and the API port. See
+`kits/burp/spec.yaml` and `files/home/bin/burp-mcp.sh`.
 
 ## Ports: use `-p`, don't rely on the automatic ones
 

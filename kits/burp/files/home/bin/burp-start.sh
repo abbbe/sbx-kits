@@ -31,6 +31,15 @@ JAVA=$(ls -d /usr/lib/jvm/java-21-openjdk-*/bin/java 2>/dev/null | head -1)
 [ -x "${JAVA:-}" ] || JAVA=$(command -v java)
 PROXY_PORT=${BURP_PROXY_PORT:-8080}
 API_PORT=${BURP_API_PORT:-8081}
+# THE EXTENSION READS THIS, AND IT READS NOTHING ELSE.  Without the export,
+# BURP_API_PORT configured only the two clients -- this script's probe and
+# burp-mcp.sh -- while the extension inside Burp bound its own compiled-in
+# default. Setting BURP_API_PORT to anything but 8081 therefore broke the
+# pairing silently, and it worked at all only because both sides independently
+# said 8081. BURP_MCP_SERVER_PORT is fwaeytens' spelling (the extension also
+# accepts -Dburp.mcp.server.port); an MCP server that reads neither binds
+# whatever it defaults to, and BURP_MCP_WAIT=0 below is then the honest setting.
+export BURP_MCP_SERVER_PORT="$API_PORT"
 LOG="$STATE/burp.log"
 
 : "${DISPLAY:=:1}"
@@ -69,7 +78,7 @@ if port_open "$PROXY_PORT"; then
     else
         echo "Something already holds port $PROXY_PORT; not starting a second Burp."
     fi
-    echo "  proxy :$PROXY_PORT  bridge api :$API_PORT   log: $LOG"
+    echo "  proxy :$PROXY_PORT  mcp api :$API_PORT   log: $LOG"
     exit 0
 fi
 
@@ -80,7 +89,7 @@ if [ ! -f "$JAR" ] && [ ! -f "$DIST/burp-installer.sh" ]; then
     cat >&2 <<EOF
 burp-start: no Burp at $DIST (looked for burpsuite_pro.jar and burp-installer.sh)
 
-Burp and the MCP bridge are staged on the HOST and mounted in; they are not part
+Burp and the Burp MCP server are staged on the HOST and mounted in; not part
 of this kit (PortSwigger's download needs your account, so nothing here can fetch
 it for you).
 
@@ -205,11 +214,36 @@ xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 || die \
 # back over the seeds. That is also how to harvest the config keys nobody has
 # documented -- toggle, diff, commit.
 render() {
-    python3 - "$1" "$2" <<'PY'
+    python3 - "$1" "$2" "${3:-}" <<'PY'
 import json, os, sys
 src, dst = sys.argv[1], sys.argv[2]
 raw = open(src).read().replace("@BURP_DIST@", os.environ["DIST"])
 cfg = json.loads(raw)
+
+# EXTENSIONS ARE CONTRIBUTED, NOT WRITTEN INTO THE SEED.  The seed ships an
+# empty extension list and every entry arrives as a file in extensions.d, so
+# "which MCP server is loaded" stops being a fact baked into this kit's Burp
+# configuration. Anything that wants an extension -- a different MCP server, a
+# BApp you keep locally, a second kit -- drops a .json in and changes nothing
+# else. Same seam as the desktop kit's fluxbox menu.d.
+#
+# Fragments are read in filename order, each one either an object or a list of
+# them, with @BURP_DIST@ expanded exactly as in the seed.
+ext_dir = sys.argv[3] if len(sys.argv) > 3 else ""
+if ext_dir and os.path.isdir(ext_dir):
+    frags = []
+    for name in sorted(os.listdir(ext_dir)):
+        if not name.endswith(".json"):
+            continue
+        text = open(os.path.join(ext_dir, name)).read()
+        text = text.replace("@BURP_DIST@", os.environ["DIST"])
+        loaded = json.loads(text)
+        frags.extend(loaded if isinstance(loaded, list) else [loaded])
+    if frags:
+        ext = cfg.setdefault("user_options", {}).setdefault("extender", {})
+        ext.setdefault("extensions", []).extend(frags)
+        print("[burp-start] %d extension(s) from %s" % (len(frags), ext_dir),
+              file=sys.stderr)
 
 # Fill the upstream proxy from the sandbox's own HTTPS_PROXY, or remove the
 # block entirely when there is none -- an upstream proxy pointing at a host
@@ -237,7 +271,12 @@ PY
 export DIST
 for f in user-config project-config; do
     [ -e "$STATE/$f.json" ] && continue
-    render "$HOME/etc/burp/$f.seed.json" "$STATE/$f.json" \
+    # extensions.d belongs to the user config only; project-config has no
+    # extender section and passing it one would invent a key Burp did not ask
+    # for.
+    extdir=""
+    [ "$f" = user-config ] && extdir="$HOME/etc/burp/extensions.d"
+    render "$HOME/etc/burp/$f.seed.json" "$STATE/$f.json" "$extdir" \
         || die "could not render $f.json"
     echo "[burp-start] seeded $STATE/$f.json"
 done
@@ -328,9 +367,16 @@ setsid nohup "${BURP[@]}" \
     --user-config-file="$STATE/user-config.json" \
     >>"$LOG" 2>&1 &
 
-# --- 8. Wait for both ports, or explain the failure -----------------------
+# --- 8. Wait for the proxy, or explain the failure ------------------------
+# ONLY THE PROXY IS WAITED ON HERE, and that is a deliberate narrowing.  This
+# loop used to require the MCP API too, which made starting Burp depend on a
+# port belonging to a different component: against an MCP server that speaks
+# stdio inside the JVM, or over a unix socket, that port never opens and this
+# sat for the full 120 seconds before reporting a failure that had not
+# happened. The proxy is what this script owns; the MCP side gets a bounded,
+# advisory probe below, and burp-mcp.sh waits again at the point it matters.
 for _ in $(seq 1 120); do
-    port_open "$PROXY_PORT" && port_open "$API_PORT" && break
+    port_open "$PROXY_PORT" && break
     sleep 1
 done
 
@@ -343,10 +389,28 @@ if ! port_open "$PROXY_PORT"; then
     exit 1
 fi
 
-if ! port_open "$API_PORT"; then
-    echo "burp-start: proxy is up but the MCP bridge API on $API_PORT is not." >&2
-    echo "  The extension may not have loaded -- check Extensions in the Burp UI," >&2
-    echo "  and the extension_file path in $STATE/user-config.json." >&2
+# ADVISORY, BOUNDED, AND SKIPPABLE.  Extensions load after the proxy listener
+# binds, so a single probe here would report "not up" on a healthy start; a
+# wait is needed, but it must not be this script's definition of success.
+# BURP_MCP_WAIT=0 turns it off, which is the right setting for an MCP server
+# that binds no TCP port at all.
+case "${BURP_MCP_WAIT:-30}" in
+    ""|*[!0-9]*) MCP_WAIT=30 ;;
+    *)           MCP_WAIT=${BURP_MCP_WAIT:-30} ;;
+esac
+if [ "$MCP_WAIT" -gt 0 ]; then
+    for _ in $(seq 1 "$MCP_WAIT"); do
+        port_open "$API_PORT" && break
+        sleep 1
+    done
+    if ! port_open "$API_PORT"; then
+        echo "burp-start: proxy is up but the MCP server API on $API_PORT is not." >&2
+        echo "  The extension may not have loaded -- check Extensions in the Burp UI." >&2
+        echo "  Its entry is rendered into $STATE/user-config.json once, from the" >&2
+        echo "  fragments in $HOME/etc/burp/extensions.d; a stale user-config.json" >&2
+        echo "  from before that mechanism still carries its own extension_file path." >&2
+        echo "  If this MCP server binds no port, set BURP_MCP_WAIT=0." >&2
+    fi
 fi
 
 # --- 9. Trust Burp's CA inside the sandbox --------------------------------
@@ -369,6 +433,6 @@ if [ ! -s "$CA" ]; then
 fi
 
 echo
-echo "Burp is up.  proxy :$PROXY_PORT   bridge api :$API_PORT   log: $LOG"
+echo "Burp is up.  proxy :$PROXY_PORT   mcp api :$API_PORT   log: $LOG"
 echo "  desktop:  $("$HOME/bin/desktopctl" url 2>/dev/null || echo '~/bin/desktopctl url')"
 echo "  route a command through it:  via-burp curl -sS https://target/"

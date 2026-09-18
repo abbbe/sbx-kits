@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: mixin
 name: sbx-jupyter
-version: "0.2.0"
+version: "0.3.0"
 displayName: JupyterLab + MCP
 description: JupyterLab with RTC, and jupyter-mcp-server over stdio in MCP_SERVER mode.
 requires:
@@ -16,6 +16,16 @@ args:
       Shared sandbox token. Empty means "generate one". Set it for every kit at
       once with --kit-arg token=<value>; the first kit to run creates the file
       and the rest reuse it.
+  jupyter_mcp_pkg:
+    default: jupyter-mcp-server
+    description: >-
+      What `uv pip install` is handed for the MCP server -- any requirement it
+      accepts. The default is the PyPI release. To run a fork, pass a
+      SHA-pinned VCS URL, e.g. --kit-arg
+      sbx-jupyter.jupyter_mcp_pkg=git+https://github.com/<you>/jupyter-mcp-server@<sha>
+      (namespaced: unlike token, only this kit declares it).
+      A source outside PyPI and GitHub also needs its host in
+      permissions.network.allow below, which --kit-arg cannot reach.
 
 environment:
   variables:
@@ -27,12 +37,19 @@ environment:
 # install hook that reaches an undeclared host fails `sbx create` with an error
 # that names the package manager rather than the policy. `uv pip install` needs
 # PyPI; apt is not used here, so the ubuntu archives are deliberately absent.
+#
+# github.com is listed for `jupyter_mcp_pkg` pointed at a fork, even though
+# the default value never reaches it: permissions are static and read at create
+# time, so the allowlist has to cover every value the arg can take, or
+# --kit-arg alone would not be enough to switch. git-over-https is served by github.com itself, so
+# unlike an archive download this needs no codeload.github.com.
 permissions:
   network:
     allow:
       - pypi.org:443
       - files.pythonhosted.org:443
       - astral.sh:443
+      - github.com:443
 
 ports:
   - container: 8888
@@ -73,6 +90,16 @@ setup:
     # separate jupyterlab install. PEP 668 (Ubuntu 26.04) makes a bare
     # `pip install` fail; the venv is mandatory.
     #
+    # A fork goes in through args.jupyter_mcp_pkg as git+https://...@<sha>.
+    # Three things make that work and are worth not rediscovering: uv shells
+    # out to a real git, which the base claude image provides at /usr/bin/git
+    # (2.53.0 -- no kit here installs it, so it is the image's and not ours to
+    # keep); https and not the SSH remote, because the container holds no key;
+    # and a commit SHA and not a branch, since @main reinstalls whatever that
+    # branch points at on rebuild day, which is not a pin at all. The build is
+    # plain hatchling with the version read from a file, so nothing but the
+    # sources is needed.
+    #
     # The wheel ships etc/jupyter/jupyter_server_config.d/jupyter_mcp_server.json,
     # which auto-enables the MCP *server extension* inside Jupyter — the unsafe
     # JUPYTER_SERVER topology (writes .ipynb behind RTC's back when no browser
@@ -84,7 +111,7 @@ setup:
       command: |
         set -e
         uv venv /opt/jupyter
-        VIRTUAL_ENV=/opt/jupyter uv pip install --no-cache jupyter-mcp-server
+        VIRTUAL_ENV=/opt/jupyter uv pip install --no-cache '${{ kit.args.jupyter_mcp_pkg }}'
         install -d /opt/jupyter/etc/jupyter/jupyter_server_config.d
         printf '%s\n' '{"ServerApp": {"jpserver_extensions": {"jupyter_mcp_server": false}}}' \
           > /opt/jupyter/etc/jupyter/jupyter_server_config.d/jupyter_mcp_server.json

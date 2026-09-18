@@ -43,6 +43,17 @@ KITS="jupyter,desktop,burp"
 BURP_ROOT="$HOME/.sbx/burp"
 MEMORY="8g"
 CPUS=""
+# Empty means "whatever kits/jupyter/spec.yaml defaults to", which is the PyPI
+# release. Set it to a SHA-pinned git+https URL to run a fork; the config file
+# is the place for that, since a fork you are living on is not a per-invocation
+# decision.
+JUPYTER_MCP_PKG=""
+# Empty means the sbx-burp kit's own defaults: the node half built from
+# upstream's source at the pinned ref. BURP_MCP_SRC must match the coordinate
+# that staged the extension jar; BURP_MCP_PKG is the npm spelling for the day
+# upstream publishes, and wins over BURP_MCP_SRC when set.
+BURP_MCP_SRC=""
+BURP_MCP_PKG=""
 PORT_JUPYTER=8888
 PORT_NOVNC=6080
 PORT_BURP=18080          # host side; the sandbox listener is always 8080
@@ -64,6 +75,7 @@ Commands:
   urls [NAME]      Print the URLs and token again
   status [NAME]    Sandbox state, published ports, and per-service health
   shell [NAME]     Interactive shell inside the sandbox
+  burp [NAME]      Start Burp, attached to this terminal (first run needs it)
   wake [NAME]      Start a stopped sandbox without spawning the Claude TUI
   down [NAME]      Stop the sandbox
   destroy [NAME]   Remove the sandbox (host-staged Burp state is NOT touched)
@@ -75,6 +87,10 @@ Options (for 'up'):
   --memory SIZE      Sandbox memory               (default: $MEMORY)
   --cpus N           Sandbox CPUs                 (default: sbx's own)
   --token STRING     Pin the shared token         (default: generate and keep)
+  --jupyter-mcp-pkg REQ  jupyter-mcp-server source (default: the PyPI release)
+  --burp-mcp-src OWNER/REPO@REF
+                     Burp MCP server source; match stage-burp.sh --burp-mcp-src
+  --burp-mcp-pkg SPEC    Burp MCP server as an npm spec (wins over --burp-mcp-src)
   --dry-run          Print the sbx command instead of running it
 
 NAME defaults to the sandbox mounting $PWD (for 'up': the directory name).
@@ -100,6 +116,9 @@ while [ $# -gt 0 ]; do
         --memory|-m) MEMORY="${2:?}"; shift 2 ;;
         --cpus) CPUS="${2:?}"; shift 2 ;;
         --token) TOKEN="${2:?}"; shift 2 ;;
+        --jupyter-mcp-pkg) JUPYTER_MCP_PKG="${2:?}"; shift 2 ;;
+        --burp-mcp-src) BURP_MCP_SRC="${2:?}"; shift 2 ;;
+        --burp-mcp-pkg) BURP_MCP_PKG="${2:?}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
@@ -241,6 +260,16 @@ up)
 
     load_token
     KIT_ARGS+=(--kit-arg "token=$TOKEN")
+    # Namespaced, unlike token=: jupyter_mcp_pkg is declared by sbx-jupyter alone, and
+    # an unqualified --kit-arg is offered to every kit in the composition.
+    # Skipped entirely when empty so the spec's own default stays the default.
+    if [ -n "$JUPYTER_MCP_PKG" ] && has_kit jupyter; then
+        KIT_ARGS+=(--kit-arg "sbx-jupyter.jupyter_mcp_pkg=$JUPYTER_MCP_PKG")
+    fi
+    if has_kit burp; then
+        [ -n "$BURP_MCP_SRC" ] && KIT_ARGS+=(--kit-arg "sbx-burp.burp_mcp_src=$BURP_MCP_SRC")
+        [ -n "$BURP_MCP_PKG" ] && KIT_ARGS+=(--kit-arg "sbx-burp.burp_mcp_pkg=$BURP_MCP_PKG")
+    fi
 
     PORT_JUPYTER=$(pick_port "$PORT_JUPYTER")
     PORT_NOVNC=$(pick_port "$PORT_NOVNC")
@@ -303,6 +332,13 @@ status)
     ;;
 
 shell)   require_sandbox; exec sbx exec -it "$NAME" bash -l ;;
+# ATTACHED, NOT DETACHED, and that is the whole reason this is a subcommand
+# rather than something `up` does for you. Burp's first run against a fresh
+# state directory prints the EULA and blocks on stdin; started without a
+# terminal it reads EOF and exits, leaving 70KB of licence text in burp.log and
+# nothing on the desktop. burp-start.sh detects that case and refuses, but only
+# `-it` makes the accepting possible. Later starts return once both ports answer.
+burp)    require_sandbox; exec sbx exec -it "$NAME" /home/agent/bin/burp-start.sh ;;
 # `sbx exec <name> true` starts a stopped sandbox without spawning the agent TUI.
 wake)    exec sbx exec "$NAME" true ;;
 down)    exec sbx stop "$NAME" ;;

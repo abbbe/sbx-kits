@@ -1,9 +1,9 @@
 schemaVersion: "2"
 kind: mixin
 name: sbx-burp
-version: "0.1.0"
+version: "0.4.0"
 displayName: Burp Suite Professional
-description: Burp Pro on the virtual desktop, driven by Claude through burp-mcp-bridge over stdio.
+description: Burp Pro on the virtual desktop, driven by Claude through the Burp MCP server over stdio.
 requires:
   agent: claude
 
@@ -26,8 +26,26 @@ args:
   dist:
     default: /opt/burp/dist
     description: >-
-      Host path of the read-only staged artefact directory (Burp jar, MCP bridge
-      jar, node bridge, licence key) written by stage-burp.sh.
+      Host path of the read-only staged artefact directory (Burp jar, the Burp
+      MCP server's extension jar and node half, licence key) written by
+      stage-burp.sh. WHICH MCP server -- upstream or a fork -- is chosen there,
+      at staging time, not here: this kit only ever sees the staged path.
+  burp_mcp_src:
+    default: fwaeytens/burp-mcp-bridge@v2.8.0
+    description: >-
+      OWNER/REPO@REF the MCP server's node half is built from, installed inside
+      the sandbox at create. MUST MATCH the --burp-mcp-src that staged the
+      extension jar: the halves are versioned together and arrive by two
+      different routes. burp-mcp.sh warns when they drift.
+  burp_mcp_pkg:
+    default: ""
+    description: >-
+      An npm install spec for the node half, which WINS over burp_mcp_src when
+      set. Empty by default only because upstream is not on npm yet; once it is,
+      this is the better setting -- a registry coordinate, like the jupyter
+      kit's jupyter_mcp_pkg. Note npm has no equivalent of pip's
+      #subdirectory=, and upstream keeps package.json in bridge/, so a git URL
+      here cannot work until a fork puts one at the repo root.
   state:
     default: /opt/burp/state
     description: >-
@@ -59,7 +77,16 @@ environment:
 # Burp's manual activation instead (it prints a URL you open in a browser on
 # your own machine) if you would rather portswigger.net were unreachable from a
 # sandbox that renders attacker-controlled responses.  Nothing else in this kit
-# needs it: the jars are staged from the host.
+# needs it: the Burp jar and the MCP extension jar are staged from the host.
+#
+# github.com and registry.npmjs.org are what the MCP server's node half costs.
+# Installing it here rather than staging it is deliberate: npm resolves ~90
+# transitive packages, and this way that resolution happens under the sandbox's
+# own egress policy, where a dependency reaching somewhere unexpected is a
+# denied connection in `sbx policy log` instead of silent traffic from a laptop.
+# codeload.github.com is the redirect target for archive downloads.  Once
+# burp_mcp_pkg points at a published package the two github hosts are dead
+# weight and can go.
 permissions:
   network:
     allow:
@@ -68,15 +95,18 @@ permissions:
       - ports.ubuntu.com:80
       - download.docker.com:443
       - portswigger.net:443
+      - github.com:443
+      - codeload.github.com:443
+      - registry.npmjs.org:443
 
 ports:
   - container: 8080
     protocol: tcp
     name: burp-proxy
-  # 8081 (the bridge's HTTP API) and 3000 (the bridge's own SSE listener, which
+  # 8081 (the MCP server's HTTP API) and 3000 (its own SSE listener, which
   # burp-mcp.sh disables anyway) are deliberately absent.  Both are
-  # unauthenticated and both drive Burp.  The bridge reaches 8081 over loopback
-  # and Claude reaches the bridge over stdio; neither crosses the boundary.
+  # unauthenticated and both drive Burp.  The node half reaches 8081 over
+  # loopback and Claude reaches it over stdio; neither crosses the boundary.
 
 setup:
   install:
@@ -99,25 +129,96 @@ setup:
             chmod 600 "$tok"
         fi
     # openjdk-21-jre, NOT -jre-headless.  Burp is a Swing application and the
-    # bridge extension registers UI when it loads; the headless JRE ships no AWT
-    # and Burp dies with a HeadlessException that reads as a Burp bug.  Burp
-    # needs Java 21 or later (PortSwigger's own stated minimum).
+    # MCP server's extension registers UI when it loads; the headless JRE ships
+    # no AWT and Burp dies with a HeadlessException that reads as a Burp bug.
+    # Burp needs Java 21 or later (PortSwigger's own stated minimum).
     #
-    # node is guarded rather than assumed: the bridge is an ESM package wanting
-    # node >= 18.14.1, and whether the base template carries a node runtime
-    # depends on how Claude Code was installed into it.  Never install over one
-    # that is already on PATH -- two nodes is its own class of bug.
+    # node is guarded rather than assumed: the MCP server's node half is an ESM
+    # package wanting node >= 18.14.1, and whether the base template carries a
+    # node runtime depends on how Claude Code was installed into it.  Never
+    # install over one that is already on PATH -- two nodes is its own class of
+    # bug.
+    #
+    # npm is guarded SEPARATELY, and that is not redundancy.  A node that came
+    # with the base template brings npm with it, but Ubuntu's `nodejs` package
+    # does not -- npm is a separate package there.  The node half is now
+    # installed at create rather than staged, so a missing npm is a failed
+    # create, not a papercut.
     - user: "0"
-      description: A full JRE (not headless) and a Node runtime for the bridge
+      description: A full JRE (not headless), Node and npm
       command: |
         set -e
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
         apt-get install -y --no-install-recommends openjdk-21-jre ca-certificates openssl
         command -v node >/dev/null 2>&1 || apt-get install -y --no-install-recommends nodejs
+        command -v npm >/dev/null 2>&1 || apt-get install -y --no-install-recommends npm
         rm -rf /var/lib/apt/lists/*
         java -version
         node --version
+        npm --version
+    # THE NODE HALF IS INSTALLED HERE, NOT STAGED ON THE HOST.  npm resolves
+    # ~90 transitive packages; doing it here puts that download under the
+    # sandbox's egress policy and stops the host building a node_modules tree
+    # for a platform it is not.  Two ways in, and burp_mcp_pkg wins when set:
+    # a published package (the endgame, and what makes this kit's fork story
+    # identical to the jupyter kit's), or upstream's source layout, where
+    # package.json lives in bridge/ and npm therefore cannot install the repo
+    # directly at all.
+    #
+    # --ignore-scripts: ~90 packages' lifecycle scripts would otherwise run as
+    # root at create. The tree is pure JavaScript today, so nothing needs them;
+    # if a future dependency does, it fails here, loudly, which is the right
+    # place to find out.
+    #
+    # THE LOCKFILE FALLBACK IS NOT BELT-AND-BRACES, IT IS LOAD-BEARING TODAY.
+    # Upstream's bridge/package-lock.json is broken: its safer-buffer entry
+    # carries version 2.4.1 and a resolved URL for 2.2.0, and the registry has
+    # neither (2.1.2 is latest). npm 11 quietly resolves past it, npm 9 -- what
+    # this image ships -- 404s and fails the create. Staging on the host hid
+    # this for as long as the host npm was new enough; installing here is what
+    # surfaced it. Drop the fallback once that lockfile is regenerated.
+    #
+    # entry.js is a symlink so burp-mcp.sh has one path to exec regardless of
+    # which way in was used, and regardless of what a fork calls its bin.
+    - user: "0"
+      description: The Burp MCP server's node half (npm registry, or GitHub source)
+      command: |
+        set -e
+        dst=/opt/burp-mcp-server
+        pkg='${{ kit.args.burp_mcp_pkg }}'
+        src='${{ kit.args.burp_mcp_src }}'
+        rm -rf "$dst"; install -d "$dst"
+        if [ -n "$pkg" ]; then
+            npm install -g --prefix "$dst" "$pkg"
+            entry=$(ls "$dst"/bin/* 2>/dev/null | head -1)
+            [ -n "$entry" ] || { echo "npm installed '$pkg' but left no bin in $dst/bin" >&2; exit 1; }
+            printf 'pkg %s\n' "$pkg" > "$dst/.src"
+        else
+            repo="${src%@*}"; ref="${src##*@}"
+            tmp=$(mktemp -d)
+            curl -fL --retry 3 "https://github.com/$repo/archive/$ref.tar.gz" \
+              | tar -xz --strip-components=1 -C "$tmp"
+            [ -f "$tmp/bridge/package.json" ] \
+              || { echo "$src has no bridge/package.json -- not upstream's layout" >&2; exit 1; }
+            cp -R "$tmp/bridge/." "$dst/"
+            rm -rf "$tmp"
+            ( cd "$dst" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund ) || {
+                echo "[burp-mcp] npm ci failed -- retrying WITHOUT the lockfile." >&2
+                echo "[burp-mcp] Upstream's bridge/package-lock.json pins versions that are" >&2
+                echo "[burp-mcp] not in the registry: safer-buffer says version 2.4.1 with a" >&2
+                echo "[burp-mcp] resolved URL for 2.2.0, and npm publishes neither (latest" >&2
+                echo "[burp-mcp] is 2.1.2). npm 11 ignores that silently; npm 9 404s on it." >&2
+                echo "[burp-mcp] Resolving from package.json instead: this build is NOT" >&2
+                echo "[burp-mcp] reproducible until upstream regenerates that lockfile." >&2
+                rm -f "$dst/package-lock.json"
+                ( cd "$dst" && npm install --omit=dev --ignore-scripts --no-audit --no-fund )
+            }
+            entry="$dst/index.js"
+            printf '%s\n' "$src" > "$dst/.src"
+        fi
+        ln -sfn "$entry" "$dst/entry.js"
+        chmod -R a+rX "$dst"
     # chmod +x is load-bearing: files/ entries arrive 0644 whatever their mode
     # on disk, and an unexecutable MCP wrapper fails with Permission denied,
     # which Claude reports as a broken MCP server.
@@ -126,6 +227,11 @@ setup:
       command: |
         set -e
         chown -R agent:agent /home/agent/bin /home/agent/etc
+        # This kit's fluxbox menu fragment, chowned here rather than relied on
+        # from sbx-desktop's own chown: kit overlays and hooks interleave in
+        # --kit order, so a file this kit ships must not depend on another kit's
+        # hook having run after it. Harmless when the desktop kit is absent.
+        if [ -e /home/agent/.fluxbox ]; then chown -R agent:agent /home/agent/.fluxbox; fi
         chmod +x /home/agent/bin/burp-start.sh /home/agent/bin/burp-mcp.sh /home/agent/bin/via-burp
         install -d -o agent -g agent -m 0755 /home/agent/.local /home/agent/.local/state
         install -d -o agent -g agent -m 0700 /home/agent/.local/state/burp
@@ -168,11 +274,12 @@ agentInstructions:
     ## Burp Suite Professional
 
     Burp is NOT running. Start it with `burp-start.sh`, which returns once the
-    proxy (8080) and the bridge API (8081) both answer. It takes 30-60 seconds.
+    proxy (8080) and the MCP API (8081) both answer. It takes 30-60 seconds.
 
-    The `burp` MCP server is a stdio bridge that talks to 127.0.0.1:8081, which
-    only exists while Burp is up. If burp tools fail with a connection error,
-    run `burp-start.sh` and then `/mcp` in this session to reconnect.
+    The `burp` MCP server is a stdio process that talks to 127.0.0.1:8081, an
+    API published by a Burp extension and so existing only while Burp is up. If
+    burp tools fail with a connection error, run `burp-start.sh` and then `/mcp`
+    in this session to reconnect.
 
     ### Routing traffic through Burp
     There is no global HTTP_PROXY and there must not be one -- it would send

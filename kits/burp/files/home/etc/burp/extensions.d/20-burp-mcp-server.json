@@ -1,0 +1,8 @@
+{
+  "extension_type": "java",
+  "extension_file": "@BURP_DIST@/burp-mcp-server.jar",
+  "name": "Burp MCP Bridge",
+  "loaded": true,
+  "errors": "ui",
+  "output": "ui"
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage Burp Pro and the MCP bridge on the HOST, for mounting into a sandbox.
+# Stage Burp Pro and the Burp MCP server on the HOST, for mounting into a sandbox.
 #
 # This runs on your machine, not in the sandbox, and it is deliberately NOT
 # under files/ so it never gets shipped into one.  It works the same on macOS
@@ -22,7 +22,20 @@ set -euo pipefail
 
 KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${HOME}/.sbx/burp"
-BRIDGE_VERSION="2.8.0"
+# THE BURP MCP SERVER IS TWO HALVES, AND ONLY ONE OF THEM IS STAGED HERE.
+# The extension jar is a Burp extension publishing a JSON-RPC API on
+# 127.0.0.1:8081; the node half speaks MCP over stdio and calls that API.  The
+# node half is NOT staged -- kits/burp/spec.yaml installs it inside the sandbox
+# at create, so npm runs under the sandbox's egress policy rather than on your
+# machine.  Only the jar is here, because Burp loads it from a file path and
+# nothing in the sandbox builds Java.
+#
+# BURP_MCP_SRC is the same owner/repo@ref coordinate the kit arg takes, and the
+# two must agree: the halves are versioned together and nothing enforces it
+# across the two commands.  Staging writes the value into dist/ so burp-mcp.sh
+# can warn when they drift.
+BURP_MCP_SRC="fwaeytens/burp-mcp-bridge@v2.8.0"
+BURP_MCP_JAR=""
 JAR=""
 INSTALLER=""
 LICENSE_FILE=""
@@ -45,7 +58,16 @@ Usage: $0 (--installer PATH | --jar PATH) [options]
                          chromium-{linux64,macosx64,win64} and nothing for
                          linuxarm64, despite declaring it in chromium.properties).
   --root DIR             Staging root (default: \$HOME/.sbx/burp)
-  --bridge-version VER   fwaeytens/burp-mcp-bridge release (default: $BRIDGE_VERSION)
+  --burp-mcp-src OWNER/REPO@REF
+                         Where the Burp MCP server's EXTENSION JAR comes from.
+                         A vX.Y.Z ref names the release whose jar is fetched;
+                         any other ref needs --burp-mcp-jar too, since nothing
+                         here builds Java. Pass the SAME coordinate to the kit
+                         (--burp-mcp-src on bin/sbx-kits) so both halves match.
+                         (default: $BURP_MCP_SRC)
+  --burp-mcp-jar PATH    Use this extension jar instead of a release asset --
+                         what a fork on a branch needs. Build one from a
+                         checkout with: mvn -f extension/pom.xml package
   --license-file FILE    File containing your Burp licence key (else prompted)
   --reseed               Copy the live Burp configs from state/ back over this
                          kit's *.seed.json, re-parameterising absolute paths.
@@ -58,7 +80,8 @@ while [ $# -gt 0 ]; do
         --jar) JAR="${2:?}"; shift 2 ;;
         --installer) INSTALLER="${2:?}"; shift 2 ;;
         --root) ROOT="${2:?}"; shift 2 ;;
-        --bridge-version) BRIDGE_VERSION="${2:?}"; shift 2 ;;
+        --burp-mcp-src) BURP_MCP_SRC="${2:?}"; shift 2 ;;
+        --burp-mcp-jar) BURP_MCP_JAR="${2:?}"; shift 2 ;;
         --license-file) LICENSE_FILE="${2:?}"; shift 2 ;;
         --reseed) RESEED=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -96,6 +119,16 @@ srv = cfg.get("user_options", {}).get("connections", {}).get("upstream_proxy", {
 for s in srv.get("servers", []):
     s["proxy_host"] = "@PROXY_HOST@"
     s["proxy_port"] = 0
+# EXTENSIONS ARE DROPPED ON THE WAY BACK IN.  A live user config lists every
+# extension Burp had loaded, with absolute paths; copying that into the seed
+# would re-bake one sandbox's jar path into the kit and silently undo
+# extensions.d, which is where entries are supposed to come from. So reseed
+# harvests settings and never extensions: to add one, write a fragment.
+ext = cfg.get("user_options", {}).get("extender", {})
+if ext.get("extensions"):
+    print("  dropped %d extension entry(ies) -- those belong in "
+          "files/home/etc/burp/extensions.d/" % len(ext["extensions"]))
+    ext["extensions"] = []
 json.dump(cfg, open(seed, "w"), indent=2)
 open(seed, "a").write("\n")
 print("reseeded %s" % seed)
@@ -107,14 +140,12 @@ PY
 fi
 
 # --- preflight ------------------------------------------------------------
-for c in curl tar unzip python3 node npm; do
+# No node, no npm: the node half is installed in the sandbox now, so this script
+# never runs a package manager and never builds anything for a platform it is
+# not running on.  That is the whole point of moving it.
+for c in curl tar unzip python3; do
     command -v "$c" >/dev/null 2>&1 || die "missing required tool: $c"
 done
-node_major=$(node -p 'process.versions.node.split(".")[0]')
-node_minor=$(node -p 'process.versions.node.split(".")[1]')
-if [ "$node_major" -lt 18 ] || { [ "$node_major" -eq 18 ] && [ "$node_minor" -lt 14 ]; }; then
-    die "node $(node -v) is too old; the bridge needs >= 18.14.1"
-fi
 
 [ -n "$JAR" ] || [ -n "$INSTALLER" ] || {
     usage >&2; echo >&2; die "one of --installer (preferred) or --jar is required"; }
@@ -166,36 +197,46 @@ if [ -n "$JAR" ]; then
     cp "$JAR" "$ROOT/dist/burpsuite_pro.jar"
 fi
 
-# --- MCP bridge: extension jar + node bridge ------------------------------
-# Both are public GitHub release artefacts, so unlike the Burp jar these CAN be
-# fetched.  github.com is allowed by sbx's default egress policy too, but that
-# is irrelevant here -- this is a host download.
-echo "==> burp-mcp-bridge $BRIDGE_VERSION extension jar"
-curl -fL --retry 3 -o "$ROOT/dist/burp-mcp-bridge.jar" \
-    "https://github.com/fwaeytens/burp-mcp-bridge/releases/download/v${BRIDGE_VERSION}/burp-mcp-bridge-${BRIDGE_VERSION}.jar"
-unzip -p "$ROOT/dist/burp-mcp-bridge.jar" META-INF/MANIFEST.MF >/dev/null 2>&1 \
-    || die "the downloaded bridge jar has no manifest -- probably an HTML error page"
+# --- the Burp MCP server: the extension jar only ---------------------------
+# The jar is a public GitHub release asset, so unlike the Burp jar it CAN be
+# fetched -- on the host, because Burp loads the extension from a file path on
+# the read-only dist mount.  Its other half, the node process, is not here: the
+# kit installs it inside the sandbox at create.
+#
+# A REF WITH NO RELEASE BEHIND IT YIELDS NO JAR, because nothing here builds
+# Java.  That is what --burp-mcp-jar is for: build it from your checkout
+# (mvn -f extension/pom.xml package) and point at the result.
+BURP_MCP_REPO="${BURP_MCP_SRC%@*}"
+BURP_MCP_REF="${BURP_MCP_SRC##*@}"
+SERVER_NAME="${BURP_MCP_REPO##*/}"
 
-echo "==> burp-mcp-bridge $BRIDGE_VERSION node bridge"
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-curl -fL --retry 3 "https://github.com/fwaeytens/burp-mcp-bridge/archive/refs/tags/v${BRIDGE_VERSION}.tar.gz" \
-    | tar -xz -C "$TMP"
-rm -rf "$ROOT/dist/bridge"
-mkdir -p "$ROOT/dist/bridge"
-cp -R "$TMP/burp-mcp-bridge-${BRIDGE_VERSION}/bridge/." "$ROOT/dist/bridge/"
-( cd "$ROOT/dist/bridge" && { npm ci --omit=dev >/dev/null 2>&1 || npm install --omit=dev >/dev/null 2>&1; } ) \
-    || die "npm install failed in $ROOT/dist/bridge"
-
-# node_modules IS BUILT ON THE HOST AND RUN ON LINUX, so it may only contain
-# portable JavaScript.  Today the bridge's single dependency is
-# @modelcontextprotocol/sdk, which is pure JS -- this check exists so that the
-# day that stops being true you find out here, rather than as an inscrutable
-# ERR_DLOPEN_FAILED when Claude first calls a burp tool.
-if find "$ROOT/dist/bridge/node_modules" -name '*.node' -print -quit 2>/dev/null | grep -q .; then
-    die "a bridge dependency ships a compiled native binding; node_modules built here will not
-    load inside the sandbox. Install it in the sandbox instead of staging it."
+echo "==> $BURP_MCP_REPO $BURP_MCP_REF extension jar"
+if [ -n "$BURP_MCP_JAR" ]; then
+    [ -f "$BURP_MCP_JAR" ] || die "no such file: $BURP_MCP_JAR"
+    cp "$BURP_MCP_JAR" "$ROOT/dist/burp-mcp-server.jar"
+    echo "    from $BURP_MCP_JAR"
+    # Deliberately no .src marker: a jar handed over as a file has no provenance
+    # this script can record, so there is nothing honest to compare against.
+    rm -f "$ROOT/dist/burp-mcp-server.src"
+else
+    case "$BURP_MCP_REF" in
+        v*.*.*) : ;;
+        *) die "'$BURP_MCP_REF' in --burp-mcp-src is not a vX.Y.Z release tag, so there is
+    no release asset to fetch. Build the extension jar from that ref --
+    mvn -f extension/pom.xml package -- and pass it with --burp-mcp-jar." ;;
+    esac
+    # Upstream's asset is named <repo>-<version>.jar; a fork whose release
+    # workflow is inherited unchanged produces the same spelling.  If yours does
+    # not, --burp-mcp-jar sidesteps this URL entirely.
+    curl -fL --retry 3 -o "$ROOT/dist/burp-mcp-server.jar" \
+        "https://github.com/${BURP_MCP_REPO}/releases/download/${BURP_MCP_REF}/${SERVER_NAME}-${BURP_MCP_REF#v}.jar"
+    # WHAT THE JAR CAME FROM, for burp-mcp.sh to compare against what the kit
+    # installed in the sandbox.  The two halves are versioned together and they
+    # now arrive by two different routes, so drift is possible and silent.
+    printf '%s\n' "$BURP_MCP_SRC" > "$ROOT/dist/burp-mcp-server.src"
 fi
+unzip -p "$ROOT/dist/burp-mcp-server.jar" META-INF/MANIFEST.MF >/dev/null 2>&1 \
+    || die "$ROOT/dist/burp-mcp-server.jar has no manifest -- probably an HTML error page"
 
 # --- licence key ----------------------------------------------------------
 echo "==> licence key"
@@ -214,7 +255,7 @@ fi
 chmod 600 "$ROOT/dist/license.key"
 
 # --- manifest -------------------------------------------------------------
-( cd "$ROOT/dist" && sha256 burp-mcp-bridge.jar \
+( cd "$ROOT/dist" && sha256 burp-mcp-server.jar \
     $([ -f burpsuite_pro.jar ] && echo burpsuite_pro.jar) \
     $([ -f burp-installer.sh ] && echo burp-installer.sh) > MANIFEST.sha256 )
 
@@ -223,13 +264,16 @@ REPO_ROOT="$(cd "$KIT_DIR/../.." && pwd)"
 
 cat <<EOF
 
-Staged into $ROOT  (bridge $BRIDGE_VERSION)
+Staged into $ROOT  (MCP extension jar: $BURP_MCP_SRC)
 $([ -f "$ROOT/dist/burp-installer.sh" ] && printf '    dist/burp-installer.sh      %s (installed on first burp-start.sh)' "$(du -h "$ROOT/dist/burp-installer.sh" | cut -f1)")
 $([ -f "$ROOT/dist/burpsuite_pro.jar" ] && printf '    dist/burpsuite_pro.jar      %s' "$(du -h "$ROOT/dist/burpsuite_pro.jar" | cut -f1)")
-    dist/burp-mcp-bridge.jar    $(du -h "$ROOT/dist/burp-mcp-bridge.jar" | cut -f1)
-    dist/bridge/                node bridge with node_modules
+    dist/burp-mcp-server.jar    $(du -h "$ROOT/dist/burp-mcp-server.jar" | cut -f1)
     dist/license.key            (0600)
     state/                      empty until first run; holds the activation
+
+The MCP server's node half is NOT staged. The kit installs it inside the sandbox
+at create, so npm resolves and downloads under the sandbox's egress policy
+instead of on this machine.$([ "$BURP_MCP_SRC" != "fwaeytens/burp-mcp-bridge@v2.8.0" ] && printf '\n\nYou staged a non-default jar, so pass the MATCHING coordinate at create or the\ntwo halves will be different versions:\n\n    %s/bin/sbx-kits up --burp-mcp-src %s' "$REPO_ROOT" "$BURP_MCP_SRC")
 
 This script stages artefacts and stops there; creating and driving the sandbox
 belongs to the wrapper, which owns the kit list, the mounts, the shared token and
