@@ -1,0 +1,326 @@
+schemaVersion: "2"
+kind: mixin
+name: sbx-browser
+version: "0.1.0"
+displayName: Chromium + Playwright + MCP
+description: >-
+  A real Chromium on the virtual desktop, and the Playwright MCP server driving
+  that same binary headed, so the human watches the page the agent is on.
+requires:
+  agent: claude
+
+args:
+  token:
+    default: ""
+    description: >-
+      Shared sandbox token. Empty means "generate one". Set it for every kit at
+      once with --kit-arg token=<value>.
+  playwright_mcp_pkg:
+    default: "@playwright/mcp@0.0.81"
+    description: >-
+      What `npm install` is handed for the MCP server -- any spec it accepts.
+      THE BROWSER COMES FROM WHATEVER THIS RESOLVES TO: the package pins an
+      exact playwright version, and the Chromium downloaded below is the
+      revision that version names, so these are one decision and not two.
+      A fork is `github:<you>/mcp#<sha>` or a scoped package name; a source
+      outside npm and GitHub also needs its host in permissions.network.allow,
+      which --kit-arg cannot reach.
+  browsers:
+    default: chromium
+    description: >-
+      Space-separated Playwright browser names to download, passed to
+      `playwright install`. Only chromium is wired into the menu entry and the
+      MCP server; `chromium firefox webkit` gets the other two for Playwright
+      scripts, at roughly 500MB more. Note Playwright's firefox and webkit are
+      PATCHED builds -- they are not the distro's, and nothing but Playwright
+      can drive them.
+
+environment:
+  variables:
+    # DISPLAY is deliberately absent: sbx-desktop owns it, and
+    # environment.variables merges across a composition as a union in which a
+    # conflicting key is a compose-time error rather than a last-wins. The
+    # scripts here default it to :1, exactly as the burp kit's do.
+    #
+    # PLAYWRIGHT_BROWSERS_PATH IS LOAD-BEARING, NOT TIDINESS. Playwright's
+    # default is $XDG_CACHE_HOME/ms-playwright, i.e. PER USER -- and the
+    # download below runs as root at create while every consumer runs as agent.
+    # Left unset, ~450MB of Chromium lands in /root/.cache where the agent
+    # cannot read it, and the first browser launch says "Executable doesn't
+    # exist ... Run npx playwright install" while the file is plainly on disk.
+    PLAYWRIGHT_BROWSERS_PATH: /opt/playwright/browsers
+    # Where the MCP server and its copy of playwright live. Deliberately NOT
+    # named PLAYWRIGHT_HOME or anything else in playwright's own namespace:
+    # PLAYWRIGHT_* is a configuration surface the server reads, and a variable
+    # that happens to collide with a future one would be read as a setting.
+    PLAYWRIGHT_ROOT: /opt/playwright
+    BROWSER_STATE: /home/agent/.local/state/browser
+    # TWO PROFILES, AND THEY MUST STAY TWO. Chromium takes an exclusive lock on
+    # a user-data-dir; a second process pointed at the same one does not share
+    # it, it hands its command line to the running instance and exits. So if the
+    # menu browser and the MCP server's browser shared a profile, whichever
+    # started second would silently become a new tab in the first -- and
+    # Playwright, holding no CDP connection to it, would report a launch
+    # failure. Separate dirs is what makes "the human browses while the agent
+    # browses" work at all.
+    BROWSER_PROFILE: /home/agent/.local/state/browser/profile
+    BROWSER_MCP_PROFILE: /home/agent/.local/state/browser/mcp-profile
+
+# The complete outbound contract for this kit.
+#
+# apt-get update refreshes EVERY configured source, so download.docker.com is
+# needed on the *-docker templates even though nothing here installs from it;
+# ubuntu splits amd64 (archive/security) from arm64 (ports), so all three are
+# listed and the kit works on an Apple Silicon Mac and on x86 CI alike.
+#
+# THE TWO PLAYWRIGHT CDN HOSTS ARE BOTH REQUIRED, and listing only the obvious
+# one is a slow failure rather than a fast one. playwright-core carries an
+# ordered mirror list -- cdn.playwright.dev/dbazure/download/playwright, then
+# playwright.download.prss.microsoft.com/dbazure/download/playwright, then
+# cdn.playwright.dev -- and walks it on failure. The first host 302s to the
+# second for the actual bytes, so a policy allowing only cdn.playwright.dev
+# gets a redirect it cannot follow, and Playwright reports it as a download
+# error against the host it was NOT denied.
+#
+# registry.npmjs.org is the MCP server. github.com and codeload.github.com are
+# what a fork costs: permissions are static and read at create time, so the
+# allowlist has to cover every value playwright_mcp_pkg can take or --kit-arg
+# alone would not be enough to switch. Drop them if you never point it at one.
+#
+# NOTHING HERE ALLOWS THE BROWSER TO REACH A TARGET. This list is the kit's own
+# install-time contract; egress stays default-deny for the pages you then
+# visit, which is the point -- see README "Egress is default-deny".
+permissions:
+  network:
+    allow:
+      - archive.ubuntu.com:80
+      - security.ubuntu.com:80
+      - ports.ubuntu.com:80
+      - download.docker.com:443
+      - registry.npmjs.org:443
+      - cdn.playwright.dev:443
+      - playwright.download.prss.microsoft.com:443
+      - github.com:443
+      - codeload.github.com:443
+
+# No ports. The MCP server is stdio, like the other two in this repo, and
+# Chromium's remote-debugging port is deliberately not opened: it is
+# unauthenticated and it is full control of the browser, so anything that can
+# reach it can read every session the profile holds.
+
+setup:
+  install:
+    # Identical, idempotent copy of the token bootstrap in every kit here, so
+    # any subset composes: the first kit in --kit order creates the file and the
+    # rest reuse it. Inline rather than a shipped script on purpose -- a shared
+    # file under files/ would raise an overlay-ordering question this does not.
+    #
+    # This kit has no use for the token itself. It is here so that `--kits
+    # browser` alone still produces a sandbox whose other kits, added later,
+    # find the file where they expect it.
+    - user: "0"
+      description: Shared sandbox token (creates it, or reuses an existing one)
+      command: |
+        set -e
+        tok=/home/agent/.sbx-token
+        if [ ! -s "$tok" ]; then
+            preset='${{ kit.args.token }}'
+            [ -n "$preset" ] || preset="${SBX_TOKEN:-}"
+            [ -n "$preset" ] || preset="$(head -c 18 /dev/urandom | base64 | tr -d '/+=')"
+            umask 077
+            # Newline-terminated so `cat ~/.sbx-token` does not run into the
+            # next prompt. Consumers read it through $(cat ...) / $(cut ...),
+            # and command substitution strips trailing newlines.
+            printf '%s\n' "$preset" > "$tok"
+            chown agent:agent "$tok"
+            chmod 600 "$tok"
+        fi
+    # THE PACKAGE LIST IS PLAYWRIGHT'S OWN, PLUS WHAT HEADED COSTS.
+    #
+    # The first block is verbatim the chromium entry from playwright-core's
+    # ubuntu26.04 dependency table (packages/playwright-core/src/server/
+    # registry, reachable as `playwright install-deps --dry-run chromium`).
+    # Re-read it on a version bump rather than assuming: the t64 suffixes are
+    # Ubuntu's 64-bit time_t transition and they did not exist before 24.04.
+    #
+    # `playwright install --with-deps` would install that list for us and is
+    # NOT used, for one measured reason: installDeps unconditionally adds the
+    # 'tools' group as well, which is xvfb plus eight font packages (and, via
+    # xvfb, xserver-common and libunwind8). This kit composes with a real X
+    # server -- pulling in a second, headless one that nothing starts is
+    # confusing rather than merely wasteful. The cost of skipping it is that
+    # `playwright install-deps --dry-run chromium` reports 10 missing packages
+    # in this sandbox forever; every one of them is from that group, and no
+    # chromium LIBRARY is among them. Re-run it after changing this list: any
+    # lib appearing there is a real omission.
+    #
+    # libgtk-3-0t64 IS NOT IN PLAYWRIGHT'S LIST AND IS REQUIRED HERE. That list
+    # is sized for headless, where Chromium never loads a toolkit; headed it
+    # dlopens libgtk-4.so.1 and falls back to libgtk-3.so.0, and with neither
+    # present it aborts during startup. Nothing in Playwright's own preflight
+    # catches this, because by its lights the dependency is satisfied. Measured
+    # on a windowed Chromium's /proc/<pid>/maps: libgtk-3 is mapped, libgtk-4
+    # is not, and libxcursor1/libxi6 are mapped too. libxshmfence1, libvulkan1
+    # and libxtst6 look like they belong in that sentence and were measured NOT
+    # to be mapped -- Xvnc offers no DRI3 and no Vulkan -- so they are left out.
+    #
+    # The fonts are not decoration. Without a CJK face and an emoji face a
+    # sizeable share of the live web renders as tofu boxes, which on a desktop
+    # you are looking at reads as a broken page rather than a missing font.
+    #
+    # libnss3-tools is certutil, and it is here for `browser --via-burp`:
+    # Chromium does not read /etc/ssl/certs, it reads an NSS database, so
+    # trusting Burp's CA is a certutil call and not a cp.
+    - user: "0"
+      description: Chromium's runtime libraries, fonts, and certutil
+      command: |
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
+          libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
+          libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
+          libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
+          libgtk-3-0t64 libxcursor1 libxi6 \
+          fonts-liberation fonts-noto-color-emoji fonts-noto-cjk \
+          libnss3-tools ca-certificates
+        rm -rf /var/lib/apt/lists/*
+    # node is guarded rather than assumed, in the same register as the burp
+    # kit: whether the base template carries a node runtime depends on how
+    # Claude Code was installed into it, and installing over one already on
+    # PATH is its own class of bug. npm is guarded SEPARATELY and that is not
+    # redundancy -- a node that came with the base image brings npm, Ubuntu's
+    # `nodejs` package does not.
+    - user: "0"
+      description: Node and npm, only if the base image has none
+      command: |
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+            apt-get update
+            command -v node >/dev/null 2>&1 || apt-get install -y --no-install-recommends nodejs
+            command -v npm >/dev/null 2>&1 || apt-get install -y --no-install-recommends npm
+            rm -rf /var/lib/apt/lists/*
+        fi
+        node --version
+        npm --version
+    # A LOCAL INSTALL IN /opt/playwright, NOT `npm install -g`. With -g only the
+    # TOP-LEVEL package's bins are linked, and `playwright` is a dependency of
+    # @playwright/mcp rather than the thing being installed -- so the CLI that
+    # downloads the browser would not exist on PATH and would have to be dug out
+    # of lib/node_modules by hand. A plain local install puts both
+    # node_modules/.bin/playwright and node_modules/.bin/playwright-mcp where
+    # anything can find them, at exactly the versions that ship together.
+    #
+    # --ignore-scripts, then an explicit `playwright install`. The postinstall
+    # script is what would normally fetch the browsers, and it fetches ALL of
+    # them into whatever path it computes at that moment. Suppressing it and
+    # calling the CLI afterwards is what makes args.browsers mean anything, and
+    # what puts the download under PLAYWRIGHT_BROWSERS_PATH above.
+    #
+    # `playwright install` with no --with-deps: see the apt step above for why.
+    - user: "0"
+      description: The Playwright MCP server, and the Chromium it drives
+      command: |
+        set -e
+        dst=/opt/playwright
+        rm -rf "$dst"; install -d "$dst"
+        cd "$dst"
+        printf '%s\n' '{"name":"sbx-browser","private":true}' > package.json
+        npm install --no-audit --no-fund --ignore-scripts '${{ kit.args.playwright_mcp_pkg }}'
+        [ -x "$dst/node_modules/.bin/playwright" ] \
+          || { echo "'${{ kit.args.playwright_mcp_pkg }}' brought no playwright CLI -- not @playwright/mcp's dependency layout" >&2; exit 1; }
+        printf '%s\n' '${{ kit.args.playwright_mcp_pkg }}' > "$dst/.src"
+        # Unquoted on purpose, and the only unquoted kit arg in this repo:
+        # args.browsers is a LIST and has to word-split. Everything else here
+        # is quoted, which is the right default -- see args.playwright_mcp_pkg.
+        PLAYWRIGHT_BROWSERS_PATH=/opt/playwright/browsers \
+          "$dst/node_modules/.bin/playwright" install ${{ kit.args.browsers }}
+        # World-readable: the download ran as root, everything that reads it
+        # runs as agent. a+rX and not a+rw -- these are executables nothing
+        # should be rewriting after create.
+        chmod -R a+rX "$dst"
+        # Fail here, at create, rather than at the agent's first browser call.
+        # executablePath() is Playwright's own resolver, so this also proves
+        # PLAYWRIGHT_BROWSERS_PATH agrees with where the download actually went.
+        exe=$(PLAYWRIGHT_BROWSERS_PATH=/opt/playwright/browsers \
+              node -e 'console.log(require("/opt/playwright/node_modules/playwright-core").chromium.executablePath())')
+        [ -x "$exe" ] || { echo "playwright resolved chromium to '$exe', which is not executable" >&2; exit 1; }
+        echo "chromium: $exe"
+    # chmod +x is load-bearing, not hygiene: files/ entries arrive 0644 whatever
+    # their mode on disk, and an unexecutable MCP wrapper fails with Permission
+    # denied, which Claude reports as a broken MCP server.
+    - user: "0"
+      description: State directories and script permissions
+      command: |
+        set -e
+        install -d -o agent -g agent -m 0755 /home/agent/.local /home/agent/.local/state
+        install -d -o agent -g agent -m 0700 /home/agent/.local/state/browser
+        install -d -o agent -g agent -m 0700 /home/agent/.pki /home/agent/.pki/nssdb
+        chown -R agent:agent /home/agent/bin
+        # This kit's fluxbox menu fragment, chowned here rather than relied on
+        # from sbx-desktop's own chown: kit overlays and hooks interleave in
+        # --kit order, so a file this kit ships must not depend on another kit's
+        # hook having run after it. Harmless when the desktop kit is absent.
+        if [ -e /home/agent/.fluxbox ]; then chown -R agent:agent /home/agent/.fluxbox; fi
+        chmod +x /home/agent/bin/browser /home/agent/bin/playwright-mcp.sh
+    # Install commands run synchronously at create, BEFORE the CLI attaches and
+    # launches the interactive session -- registering here is race-free. Startup
+    # commands are fired by a detached dispatcher that races the session; never
+    # register MCP there. `claude mcp add` is not idempotent, hence `|| true`.
+    - user: "agent"
+      description: Register the stdio MCP server with Claude (install-time, race-free)
+      command: |
+        set -e
+        export PATH="$HOME/.local/bin:$HOME/.claude/local:$PATH"
+        claude mcp add playwright --scope user -- /home/agent/bin/playwright-mcp.sh || true
+
+  # No startup: block. The MCP server is spawned by Claude on demand, and the
+  # menu browser is started by a human clicking it. Nothing here should be
+  # holding ~400MB of Chromium resident in a sandbox that is not browsing.
+
+agentInstructions:
+  content: |
+    ## Browser (Chromium) and the Playwright MCP server
+
+    The `playwright` MCP server drives a real Chromium. When the desktop kit is
+    composed in it runs **headed on `$DISPLAY`**, so the human watching noVNC
+    sees the page you are on -- that is the point of it, and it is worth saying
+    out loud when you start browsing. With no desktop it falls back to headless
+    and everything else is the same.
+
+    The browser starts on the first `browser_*` tool call, not at session start,
+    and takes a few seconds to appear.
+
+    ### The human's browser is a different browser
+    `browser` on the command line opens a Chromium the human drives, on its own
+    profile. Yours is `$BROWSER_MCP_PROFILE`, theirs is `$BROWSER_PROFILE`, and
+    the split is deliberate: Chromium locks a profile directory, so one profile
+    would mean the second launch silently folding into the first. Logins and
+    cookies therefore do NOT carry across, and there is no supported way to
+    copy a live Chromium profile out from under a running browser. When you
+    need a session the human has and you do not, log in yourself with the
+    browser tools while they watch, or ask them for the credential.
+
+    ### Routing through Burp
+    Only when the burp kit is composed in and Burp is running:
+
+        browser --via-burp https://target.example.com/
+
+    That sets Chromium's proxy and trusts Burp's CA in the NSS database, which
+    is where Chromium looks -- the system bundle that `burp-start.sh` writes is
+    not read by Chromium at all. For the MCP server, add
+    `--proxy-server=http://127.0.0.1:8080` to `$PLAYWRIGHT_MCP_ARGS` and
+    reconnect with `/mcp`.
+
+    ### If a page will not load
+    Egress is default-deny and the browser is subject to it like everything
+    else, so an unreachable site is usually policy and not the browser.
+    `sbx policy check network <host>` states the reason. The fix is a host
+    command -- there is no sbx inside a sandbox:
+
+        sbx policy allow network --sandbox <name> "target.example.com:443"
+
+    A page that half-loads is the same thing: the document came from an allowed
+    host and its scripts, fonts or XHR targets did not.
