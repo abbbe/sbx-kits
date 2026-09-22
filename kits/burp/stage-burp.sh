@@ -5,13 +5,19 @@
 # under files/ so it never gets shipped into one.  It works the same on macOS
 # and Linux: nothing here looks in /Applications or anywhere else macOS-specific.
 #
-# WHY STAGING AT ALL, RATHER THAN DOWNLOADING AT CREATE.  Three reasons, in
-# order of weight.  The licence and Burp's project file need a writable host
-# directory regardless, and once that exists putting the jars beside it is free.
-# portswigger.net is the last host you want reachable from a sandbox that
-# renders attacker-controlled responses, and staging keeps it off the
-# allowlist.  And a ~400MB download on every `sbx create` is a tax with no
-# upside, since the jar changes monthly at most.
+# WHY STAGING AT ALL, RATHER THAN DOWNLOADING AT CREATE.  portswigger.net is
+# the last host you want reachable from a sandbox that renders
+# attacker-controlled responses, and staging keeps it off the allowlist.  And a
+# ~400MB download on every `sbx create` is a tax with no upside, since the jar
+# changes monthly at most.
+#
+# WHAT THIS DIRECTORY IS NOT.  It is mounted READ-ONLY into every sandbox, and
+# it holds only artefacts: the Burp installer or jar, the MCP extension jar, the
+# licence key, and -- once you have harvested it -- prefs.xml.  It holds NO
+# project files and no live Burp state.  There used to be a sibling `state/`
+# directory mounted read-write into every sandbox at once, and it meant a fresh
+# sandbox opened the previous engagement's proxy history while every sandbox
+# could rewrite the Burp binary the others ran.  Do not reintroduce it.
 #
 # WHY THE BURP JAR IS NOT DOWNLOADED HERE EITHER.  Measured: a GET of
 # https://portswigger.net/burp/releases/download?product=pro&version=...&type=Jar
@@ -39,12 +45,14 @@ BURP_MCP_JAR=""
 JAR=""
 INSTALLER=""
 LICENSE_FILE=""
-RESEED=0
+RESEED=""
+HARVEST=""
 
 usage() {
     cat <<EOF
 Usage: $0 (--installer PATH | --jar PATH) [options]
-       $0 --reseed [--root DIR]
+       $0 --harvest SANDBOX [--root DIR]
+       $0 --reseed  SANDBOX [--root DIR]
 
   --installer PATH       Burp Suite Professional PLATFORM INSTALLER (.sh) for
                          the sandbox's architecture. PREFER THIS: it is the only
@@ -69,9 +77,17 @@ Usage: $0 (--installer PATH | --jar PATH) [options]
                          what a fork on a branch needs. Build one from a
                          checkout with: mvn -f extension/pom.xml package
   --license-file FILE    File containing your Burp licence key (else prompted)
-  --reseed               Copy the live Burp configs from state/ back over this
-                         kit's *.seed.json, re-parameterising absolute paths.
-                         Run it after changing settings in the Burp GUI.
+  --harvest SANDBOX      Copy Burp's accepted EULA and licence activation OUT of
+                         a running sandbox into dist/prefs.xml, so every later
+                         sandbox is created already licensed instead of spending
+                         a fresh activation. Burp's CA is stripped on the way --
+                         each sandbox mints its own rather than sharing one
+                         private key across engagements. Run it once, after
+                         answering the first-run prompts in the first sandbox.
+  --reseed SANDBOX       Copy the live Burp configs out of a running sandbox
+                         back over this kit's *.seed.json, re-parameterising
+                         absolute paths. Run it after changing settings in the
+                         Burp GUI.
 EOF
 }
 
@@ -83,7 +99,8 @@ while [ $# -gt 0 ]; do
         --burp-mcp-src) BURP_MCP_SRC="${2:?}"; shift 2 ;;
         --burp-mcp-jar) BURP_MCP_JAR="${2:?}"; shift 2 ;;
         --license-file) LICENSE_FILE="${2:?}"; shift 2 ;;
-        --reseed) RESEED=1; shift ;;
+        --harvest) HARVEST="${2:?}"; shift 2 ;;
+        --reseed) RESEED="${2:?}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -96,18 +113,69 @@ sha256() {
     else shasum -a 256 "$@"; fi
 }
 
+# --- harvest mode ---------------------------------------------------------
+# THE REPLACEMENT FOR THE OLD SHARED STATE MOUNT, and the difference is that this
+# is a deliberate, one-directional copy of a couple of facts rather than a live
+# directory every sandbox writes to.
+#
+# What it takes: Burp's preferences file, carrying the accepted EULA
+# (burp.eula), the licence (license1) and the opaque activation record
+# PortSwigger hands back.  Those are what is expensive to redo -- activations are
+# a finite resource, and re-activating once per sandbox eventually means a
+# support ticket.  prune-prefs.py beside this script is where the rest of the
+# file, Burp's CA above all, is dropped; read its docstring before changing it.
+find_prefs() {
+    # WHICH prefs.xml is not knowable from the outside: install4j's JVM treats
+    # $HOME/.java as the preferences ROOT while Burp's own writes one level
+    # deeper, so the file that matters is found by CONTENT, not by path.
+    sbx exec "$1" bash -lc \
+        'grep -rls --include=prefs.xml "burp\.eula" "$HOME/.java" 2>/dev/null | head -1'
+}
+
+if [ -n "$HARVEST" ]; then
+    command -v sbx >/dev/null 2>&1 || die "no sbx on PATH; --harvest reads from a running sandbox"
+    src=$(find_prefs "$HARVEST" | tr -d '\r')
+    [ -n "$src" ] || die "no preferences with an accepted EULA in sandbox '$HARVEST'.
+    Start Burp there and answer the first-run prompts first:
+        sbx exec -it $HARVEST /home/agent/bin/burp-start.sh"
+    mkdir -p "$ROOT/dist"
+    tmp=$(mktemp)
+    sbx exec "$HARVEST" cat "$src" > "$tmp" || die "could not read $src from '$HARVEST'"
+    [ -s "$tmp" ] || die "$src came back empty"
+    python3 "$KIT_DIR/prune-prefs.py" "$tmp" "$ROOT/dist/prefs.xml" || exit 1
+    rm -f "$tmp"
+    chmod 600 "$ROOT/dist/prefs.xml"
+    echo "==> harvested $HARVEST:$src -> $ROOT/dist/prefs.xml"
+    echo "    Sandboxes created from now on start with the EULA accepted and the"
+    echo "    licence in place.  It is COPIED IN at create, never mounted: nothing"
+    echo "    a sandbox does to its own preferences reaches this file, and no"
+    echo "    sandbox can see another's."
+    exit 0
+fi
+
 # --- reseed mode ----------------------------------------------------------
-# Burp writes its configuration back to the files given by --user-config-file
-# and --config-file, and those live on the state mount.  So the way to preset a
-# setting whose JSON key nobody has documented is: set it once in the GUI, then
-# run this, then commit the diff.  That is how the proxy listener spelling and
-# Burp's "run the browser without a sandbox" toggle get captured, rather than
-# guessed.
-if [ "$RESEED" = 1 ]; then
-    [ -d "$ROOT/state" ] || die "no state directory at $ROOT/state"
+# Burp writes its user configuration back to the file given by
+# --user-config-file.  So the way to preset a setting whose JSON key nobody has
+# documented is: set it once in the GUI, then run this, then commit the diff.
+# That is how the proxy listener spelling and Burp's "run the browser without a
+# sandbox" toggle got captured, rather than guessed.
+#
+# IT READS FROM A SANDBOX, NOT FROM A HOST DIRECTORY.  These files used to sit on
+# the shared read-write state mount, where this script could simply open them.
+# There is no such mount now -- the live configs are inside whichever sandbox you
+# were experimenting in -- so that sandbox has to be named.  Quit Burp there
+# first: it writes the file on EXIT, so reseeding while it is running harvests
+# the configuration you started with rather than the one you just set.
+if [ -n "$RESEED" ]; then
+    command -v sbx >/dev/null 2>&1 || die "no sbx on PATH; --reseed reads from a running sandbox"
     for f in user-config project-config; do
-        live="$ROOT/state/$f.json"
-        [ -s "$live" ] || { echo "stage-burp: no $live yet, skipping" >&2; continue; }
+        live=$(mktemp)
+        if ! sbx exec "$RESEED" cat "/home/agent/.local/state/burp/$f.json" >"$live" 2>/dev/null ||
+           [ ! -s "$live" ]; then
+            echo "stage-burp: no $f.json in sandbox '$RESEED' yet, skipping" >&2
+            rm -f "$live"
+            continue
+        fi
         python3 - "$live" "$KIT_DIR/files/home/etc/burp/$f.seed.json" "$ROOT/dist" <<'PY'
 import json, sys
 live, seed, dist = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -133,6 +201,7 @@ json.dump(cfg, open(seed, "w"), indent=2)
 open(seed, "a").write("\n")
 print("reseeded %s" % seed)
 PY
+        rm -f "$live"
     done
     echo
     echo "Review with: git -C \"$KIT_DIR\" diff"
@@ -150,7 +219,9 @@ done
 [ -n "$JAR" ] || [ -n "$INSTALLER" ] || {
     usage >&2; echo >&2; die "one of --installer (preferred) or --jar is required"; }
 
-mkdir -p "$ROOT/dist" "$ROOT/state/java"
+# dist/ ONLY, and it is mounted :ro.  There is no state/ any more: everything
+# Burp writes belongs to one sandbox and is created inside it.  See the header.
+mkdir -p "$ROOT/dist"
 
 # The sandbox inherits the host's architecture, so the installer has to match
 # this machine, not the machine the licence was bought on.

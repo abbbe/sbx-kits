@@ -7,16 +7,25 @@ description: Burp Pro on the virtual desktop, driven by Claude through the Burp 
 requires:
   agent: claude
 
-# dist/ and state/ are staged on the HOST by stage-burp.sh and mounted in as
-# additional workspaces, which land at their IDENTICAL host path.  A mixin
-# cannot mount a host path itself (kit volumes: are container-local block
-# devices) and cannot read the mount table, so the paths have to be told to it
-# twice: once as a positional workspace and once as a kit arg.
+# dist/ is staged on the HOST by stage-burp.sh and mounted in READ-ONLY as an
+# additional workspace, which lands at its IDENTICAL host path.  A mixin cannot
+# mount a host path itself (kit volumes: are container-local block devices) and
+# cannot read the mount table, so the path has to be told to it twice: once as a
+# positional workspace and once as a kit arg.
 #
-# They have defaults rather than `required: true` so the kit still installs in a
-# bare probe sandbox with no staging present -- which is what makes the deny-all
-# network probe in the README possible.  burp-start.sh is where a missing stage
-# is reported, at length.
+# THERE IS EXACTLY ONE MOUNT AND IT IS READ-ONLY.  There used to be a second,
+# read-write `state` workspace shared by every sandbox, holding the Java
+# preferences, a ~950MB unpacked Burp installation and a single project.burp.
+# That meant a new sandbox opened the previous engagement's proxy history, every
+# sandbox could read every other one's captured traffic, and every sandbox could
+# rewrite the Burp binary the others executed.  It is gone.  Anything Burp
+# writes now lives inside the container and dies with it; anything that must
+# outlive a recreate is COPIED IN from $DIST at create, below.
+#
+# The default is there rather than `required: true` so the kit still installs in
+# a bare probe sandbox with no staging present -- which is what makes the
+# deny-all network probe in the README possible.  burp-start.sh is where a
+# missing stage is reported, at length.
 args:
   token:
     default: ""
@@ -46,16 +55,9 @@ args:
       kit's jupyter_mcp_pkg. Note npm has no equivalent of pip's
       #subdirectory=, and upstream keeps package.json in bridge/, so a git URL
       here cannot work until a fork puts one at the repo root.
-  state:
-    default: /opt/burp/state
-    description: >-
-      Host path of the read-write state directory (Java prefs and licence
-      activation, Burp project file, live configs, logs).
-
 environment:
   variables:
     BURP_DIST: "${{ kit.args.dist }}"
-    BURP_STATE: "${{ kit.args.state }}"
     BURP_PROXY_PORT: "8080"
     BURP_API_PORT: "8081"
     # DISPLAY is deliberately absent: sbx-desktop owns it, and
@@ -235,6 +237,42 @@ setup:
         chmod +x /home/agent/bin/burp-start.sh /home/agent/bin/burp-mcp.sh /home/agent/bin/via-burp
         install -d -o agent -g agent -m 0755 /home/agent/.local /home/agent/.local/state
         install -d -o agent -g agent -m 0700 /home/agent/.local/state/burp
+        install -d -o agent -g agent -m 0700 /home/agent/.local/share /home/agent/.local/share/burp
+    # COPIED IN, NOT MOUNTED.  This is the whole replacement for the old shared
+    # read-write state mount, and the difference is the point: a copy is this
+    # sandbox's own from the instant it lands, so nothing it does to Burp's
+    # preferences is visible to any other sandbox, and no other sandbox can
+    # alter what this one starts from.
+    #
+    # What is in it: the accepted EULA, the licence, and the activation record
+    # -- the things that are expensive to redo, activations being a finite
+    # resource.  What is deliberately NOT in it: Burp's CA, which stage-burp.sh
+    # --harvest strips, so every sandbox mints its own CA private key rather
+    # than sharing one across engagements.  Burp generates it on first run.
+    #
+    # Absent staging, this is a no-op and Burp's first run asks for the EULA and
+    # the licence on the terminal (burp-start.sh explains that at length).  The
+    # double .java is not a typo: install4j's JVM uses $HOME/.java as the prefs
+    # ROOT while Burp's own writes one level deeper, and harvesting preserves
+    # whichever layout produced the file.
+    - user: "0"
+      description: Seed Burp's preferences from the host-staged copy, if there is one
+      command: |
+        set -e
+        src='${{ kit.args.dist }}/prefs.xml'
+        dst=/home/agent/.java/.java/.userPrefs/burp
+        if [ -s "$src" ]; then
+            install -d -o agent -g agent -m 0700 \
+                /home/agent/.java /home/agent/.java/.java \
+                /home/agent/.java/.java/.userPrefs "$dst"
+            install -o agent -g agent -m 0600 "$src" "$dst/prefs.xml"
+            echo "[sbx-burp] seeded Burp preferences from $src (copy, not a mount)"
+        else
+            install -d -o agent -g agent -m 0700 /home/agent/.java
+            echo "[sbx-burp] no $src staged; Burp's first run will ask for the EULA"
+            echo "[sbx-burp] and licence on the terminal, and spend an activation."
+            echo "[sbx-burp] Harvest it afterwards: stage-burp.sh --harvest <sandbox>"
+        fi
     # Install commands run synchronously at create, BEFORE the CLI attaches and
     # launches the interactive session -- registering here is race-free. Startup
     # commands are fired by a detached dispatcher that races the session; never
@@ -273,8 +311,15 @@ agentInstructions:
   content: |
     ## Burp Suite Professional
 
-    Burp is NOT running. Start it with `burp-start.sh`, which returns once the
-    proxy (8080) and the MCP API (8081) both answer. It takes 30-60 seconds.
+    Burp is NOT running. Start it with `burp-start.sh`.
+
+    IT WILL NOT COME UP ON ITS OWN. Burp opens its project dialog on the desktop
+    and waits for a HUMAN to choose a project; no project, no proxy listener and
+    no MCP API. That choice is deliberately not automated -- which project an
+    engagement uses is the user's call. burp-start.sh says so and exits 0 while
+    Burp is still waiting, so treat "Burp is running but has not opened the
+    proxy yet" as an instruction to ask the user, not as a failure to retry.
+    Once a project is open the proxy answers within a few seconds.
 
     The `burp` MCP server is a stdio process that talks to 127.0.0.1:8081, an
     API published by a Burp extension and so existing only while Burp is up. If
@@ -292,11 +337,17 @@ agentInstructions:
     /usr/local/share/ca-certificates/burp.crt and in the system bundle once
     burp-start.sh has run.
 
-    ### Never edit these by hand
-    $BURP_STATE/project.burp is a proprietary binary written by a live JVM.
-    $BURP_STATE/user-config.json and project-config.json are written back by
-    Burp when it exits; change those settings in the GUI, not in a text editor
-    while Burp is running.
+    ### Where Burp's state lives
+    All of it is inside THIS sandbox and is shared with no other:
+    ~/.local/state/burp (rendered configs and burp.log), ~/.java (preferences,
+    licence, CA), ~/.local/share/burp/install (the installation), and wherever
+    the user pointed the project file, if they chose a disk project at all.
+    $BURP_DIST is the only mount and it is read-only.
+
+    A Burp project file is a proprietary binary written by a live JVM: never
+    edit one by hand. ~/.local/state/burp/user-config.json is written back by
+    Burp when it exits, so change those settings in the GUI rather than in a
+    text editor while Burp is running.
 
     ### If a target is unreachable
     Egress is default-deny, and Burp's own traffic is subject to it, so the

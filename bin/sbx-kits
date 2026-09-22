@@ -5,10 +5,9 @@
 # must be BYTE-IDENTICAL to two others:
 #
 #   sbx run --detached claude --name burpbox . \
-#     ~/.sbx/burp/dist:ro ~/.sbx/burp/state \
+#     ~/.sbx/burp/dist:ro \
 #     --kit .../kits/jupyter --kit .../kits/desktop --kit .../kits/burp \
 #     --kit-arg sbx-burp.dist=~/.sbx/burp/dist \
-#     --kit-arg sbx-burp.state=~/.sbx/burp/state \
 #     -m 8g -p 8888:8888 -p 6080:6080 -p 18080:8080
 #
 # The duplication is not gratuitous -- an additional workspace mounts at its
@@ -78,7 +77,7 @@ Commands:
   burp [NAME]      Start Burp, attached to this terminal (first run needs it)
   wake [NAME]      Start a stopped sandbox without spawning the Claude TUI
   down [NAME]      Stop the sandbox
-  destroy [NAME]   Remove the sandbox (host-staged Burp state is NOT touched)
+  destroy [NAME]   Remove the sandbox AND everything Burp wrote in it
 
 Options (for 'up'):
   --workspace DIR    Project directory to mount    (default: \$PWD)
@@ -249,13 +248,16 @@ up)
     $REPO/kits/burp/stage-burp.sh --installer /path/to/burpsuite_linux_arm64_*.sh
   (or drop 'burp' from --kits)"
         fi
-        mkdir -p "$BURP_ROOT/state"
-        # :ro on dist, read-write on state. Mount modes are per-workspace, so
-        # the parent cannot be mounted once with both.
-        MOUNTS+=("$BURP_ROOT/dist:ro" "$BURP_ROOT/state")
-        # The same paths again, because a kit cannot read the mount table.
-        KIT_ARGS+=(--kit-arg "sbx-burp.dist=$BURP_ROOT/dist"
-                   --kit-arg "sbx-burp.state=$BURP_ROOT/state")
+        # ONE MOUNT, READ-ONLY, AND NO SECOND WRITABLE ONE.  $BURP_ROOT/state
+        # used to be mounted read-write here, by every sandbox at once: they
+        # shared one project.burp (so a new sandbox opened the last
+        # engagement's proxy history), one preferences store, and one writable
+        # ~950MB Burp installation that all of them executed. Everything Burp
+        # writes is container-local now; what has to outlive a recreate is
+        # copied in from this read-only mount at create.
+        MOUNTS+=("$BURP_ROOT/dist:ro")
+        # The same path again, because a kit cannot read the mount table.
+        KIT_ARGS+=(--kit-arg "sbx-burp.dist=$BURP_ROOT/dist")
     fi
 
     load_token
@@ -303,10 +305,19 @@ up)
     print_urls
     if has_kit burp; then
         cat <<EOF
-Burp does not start with the sandbox. First run needs a terminal, because its
-EULA and licence prompts are a console conversation:
+Burp does not start with the sandbox:
 
     sbx exec -it $NAME /home/agent/bin/burp-start.sh
+
+Attached, because Burp asks things. If no prefs.xml was staged, its EULA and
+licence prompts are a console conversation on that terminal -- and answering
+them spends an activation, so harvest the answers back to the host afterwards:
+
+    $REPO/kits/burp/stage-burp.sh --harvest $NAME
+
+Then it asks, on the DESKTOP, which project to open. Nothing binds port 8080
+until you choose. This sandbox's Burp state is its own: no project history,
+preferences or installation are shared with any other sandbox.
 EOF
     fi
     ;;
@@ -334,22 +345,32 @@ status)
 shell)   require_sandbox; exec sbx exec -it "$NAME" bash -l ;;
 # ATTACHED, NOT DETACHED, and that is the whole reason this is a subcommand
 # rather than something `up` does for you. Burp's first run against a fresh
-# state directory prints the EULA and blocks on stdin; started without a
+# preferences store prints the EULA and blocks on stdin; started without a
 # terminal it reads EOF and exits, leaving 70KB of licence text in burp.log and
 # nothing on the desktop. burp-start.sh detects that case and refuses, but only
-# `-it` makes the accepting possible. Later starts return once both ports answer.
+# `-it` makes the accepting possible. Later starts return as soon as Burp is up
+# and asking which project to open -- that answer is given on the desktop.
 burp)    require_sandbox; exec sbx exec -it "$NAME" /home/agent/bin/burp-start.sh ;;
 # `sbx exec <name> true` starts a stopped sandbox without spawning the agent TUI.
 wake)    exec sbx exec "$NAME" true ;;
 down)    exec sbx stop "$NAME" ;;
 destroy)
     require_sandbox
-    printf "Remove sandbox '%s'? Host-staged Burp state in %s is NOT touched. [y/N] " "$NAME" "$BURP_ROOT"
+    # THIS DESTROYS BURP'S STATE, and the prompt has to say so now.  It used to
+    # promise the opposite, truthfully: the project file, preferences and
+    # installation lived on a host mount that `sbx rm` could not reach. They are
+    # inside the sandbox now -- which is what stops one engagement's proxy
+    # history turning up in the next sandbox -- so removing it removes them.
+    # Only $BURP_ROOT/dist, staged on the host and mounted read-only, survives.
+    printf "Remove sandbox '%s'?
+  Burp's project file(s), preferences and installation INSIDE it go too.
+  Host-staged %s/dist (Burp, licence key, prefs.xml) is NOT touched.
+  [y/N] " "$NAME" "$BURP_ROOT"
     # -f because THIS prompt is the confirmation.  `sbx rm` without it asks its
     # own "This cannot be undone" question, so the user answers twice for one
     # decision -- and the second prompt is the less informative of the two: it
-    # cannot know that the Burp state mount survives.  Keep the prompt that says
-    # something, suppress the one that does not.
+    # cannot say what is about to be lost.  Keep the prompt that says something,
+    # suppress the one that does not.
     read -r a; case "$a" in y|Y) sbx rm -f "$NAME" ;; *) echo "aborted" ;; esac
     ;;
 
