@@ -76,7 +76,8 @@ Commands:
   status [NAME]    Sandbox state, published ports, and per-service health
   shell [NAME]     Interactive shell inside the sandbox
   burp [NAME]      Start Burp, attached to this terminal (first run needs it)
-  wake [NAME]      Start a stopped sandbox without spawning the Claude TUI
+  svcs [NAME]      Start the supervised services that are not running
+  wake [NAME]      Start a stopped sandbox and its services, without the Claude TUI
   down [NAME]      Stop the sandbox
   destroy [NAME]   Remove the sandbox (host-staged Burp state is NOT touched)
 
@@ -227,6 +228,123 @@ browser window instead of being scaled to fit it.
 EOF
 }
 
+# --- per-service health ----------------------------------------------------
+# Shared by `status` and `svcs` so that the table printed after a start is the
+# same table `status` prints, probed the same way.  THE PORT IS THE AUTHORITY,
+# not the process table: desktop-svc.sh keeps three processes alive and a live
+# supervisor with a dead websockify still serves the noVNC page, so "is the
+# supervisor running" is a different question from "does the service work".
+# Both questions get asked -- this one here, the other in start_services.
+health() {
+    sbx exec "$NAME" bash -lc '
+        for p in 8888:jupyterlab 6080:novnc 5900:xvnc 8080:burp-proxy 8081:burp-mcp; do
+            port=${p%%:*}; name=${p##*:}
+            if timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+                printf "  %-12s %-5s up\n" "$name" "$port"
+            else
+                printf "  %-12s %-5s down\n" "$name" "$port"
+            fi
+        done' 2>/dev/null || true
+}
+
+# --- starting the supervised services --------------------------------------
+# WHY THIS EXISTS AT ALL.  Both kits declare their service as a `setup.startup`
+# background command, and every comment in them assumes that a stop/start cycle
+# re-runs it -- kits/desktop/spec.yaml says so in as many words ("Nothing
+# re-applies a desired state after a stop/start cycle in this platform, so the
+# desired state has to be always on").  That held on sbx 0.43.0.  It does not on
+# 0.45.1: measured on an idle sandbox, BOTH `sbx exec <name> true` and
+# `sbx run -d --name <name>` bring the container back with a fresh PID 1 and
+# never dispatch the startup commands -- the sandbox comes up carrying tini,
+# `sleep infinity` and dockerd, and nothing else.  The upgrade that did it also
+# killed every running container on the way through (sandboxd took a SIGTERM
+# mid-session and the new daemon logged "found no task and container is not
+# running" for each sandbox), so the first symptom is a sandbox that says
+# `running` with all five services down.
+#
+# So this re-applies the desired state by hand.  When sbx starts dispatching
+# startup commands again, `svcs` becomes a no-op that prints "already running"
+# -- which is exactly what it should print, so nothing here needs unwinding.
+#
+# TWO GUARDS, BECAUSE THERE ARE TWO WAYS TO GET THIS WRONG.  A second
+# supervisor is worse than none: both scripts are `while true` restart loops, so
+# the loser of the race for the port respawns forever and neither log ever
+# settles.  The process check catches a supervisor that is alive but mid-backoff
+# with its port closed; the port check catches a port held by something that is
+# not a supervisor at all (a hand-run `jupyter lab`), which is the one case
+# where doing nothing and saying so beats starting anything.
+#
+# WHY THE pgrep PATTERN IS BUILT FROM A VARIABLE AND NEVER SPELLED OUT.  The
+# whole script below is one argument to `bash -lc`, so anything written into it
+# literally is in this shell's own command line, and `pgrep -f` then finds
+# ITSELF -- the same trap burp-start.sh documents for its own double-start
+# guard.  Measured in a live sandbox, hunting the one real supervisor (pid 650):
+#
+#   script=$HOME/bin/$svc-svc.sh; pgrep -f "$script"   ->  650
+#   pgrep -f "/home/agent/bin/jupyter-svc.sh"          ->  650 827 830
+#
+# where 827 is the shell itself and 830 the subshell of the `$(...)` it ran in.
+# Building the path from $svc keeps it out of argv, which is what makes the
+# match clean; note that the literal spelling is not rescued by dropping $$
+# either, because that subshell carries the same cmdline and a different pid.
+# The `grep -vx "$$"` below is therefore insurance and not the mechanism -- it
+# is what stops this turning into a double-start bug the day someone
+# "simplifies" the loop by interpolating the two paths on the host side.
+#
+# WHY NO ENVIRONMENT IS PASSED.  jupyter-svc.sh reads WORKSPACE_DIR to find the
+# notebook root and would silently fall back to the unrelated image directory
+# /home/agent/workspace without it.  It does not need to be set here: sbx puts
+# it in the sandbox environment, so an `sbx exec` login shell already has it
+# (measured -- the restarted JupyterLab reports root_dir=<the workspace mount>).
+# Do not "fix" this by hard-coding a path.
+#
+# The logs are the one thing that is better than what the dispatcher did with
+# them: it ran these scripts with their output going nowhere, so a supervisor
+# announcing WHY it kept restarting announced it to no one.
+start_services() {
+    sbx exec "$NAME" bash -lc '
+        LOGDIR=$HOME/.local/state/sbx-kits
+        mkdir -p "$LOGDIR"
+        port_open() { timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+        waitfor=""
+        # The script being present IS the test for "this kit is installed in
+        # this sandbox" -- the host-side --kits list describes what `up` was
+        # asked for, which is not necessarily what this sandbox was built with.
+        for spec in jupyter:8888 desktop:5900; do
+            svc=${spec%%:*}; port=${spec##*:}
+            script=$HOME/bin/$svc-svc.sh
+            [ -x "$script" ] || continue
+            pid=$(pgrep -f "$script" 2>/dev/null | grep -vx "$$" | head -1)
+            if [ -n "$pid" ]; then
+                printf "  %-10s supervisor already running (pid %s)\n" "$svc" "$pid"
+            elif port_open "$port"; then
+                printf "  %-10s port %s is held by something that is not the supervisor; left alone\n" "$svc" "$port"
+            else
+                setsid nohup "$script" >>"$LOGDIR/$svc-svc.log" 2>&1 </dev/null &
+                printf "  %-10s started; log %s\n" "$svc" "$LOGDIR/$svc-svc.log"
+                waitfor="$waitfor $port"
+            fi
+        done
+        # Wait for what we just started before the table below is printed,
+        # rather than reporting a JupyterLab that is merely still importing as
+        # down.  Xvnc answers in about a second, JupyterLab in ten or so; 30s is
+        # the ceiling, and passing it is a real failure worth seeing as "down".
+        for _ in $(seq 1 60); do
+            pending=""
+            for port in $waitfor; do port_open "$port" || pending="$pending $port"; done
+            [ -z "$pending" ] && break
+            sleep 0.5
+        done
+        # Burp is on demand by design (a 2-4GB JVM most sessions do not want),
+        # so its two ports being down is not a fault -- but it is the obvious
+        # thing to wonder about when reading the table, so name it.
+        if [ -x "$HOME/bin/burp-start.sh" ] && ! port_open 8080; then
+            printf "  %-10s on demand, not supervised: sbx-kits burp %s\n" "burp" "$1"
+        fi' sbx-kits "$NAME" 2>/dev/null || true
+    echo
+    health
+}
+
 case "$CMD" in
 up)
     sandbox_exists && die "sandbox '$NAME' already exists and mounts this workspace.
@@ -320,15 +438,14 @@ status)
     require_sandbox
     sbx ls 2>/dev/null | awk -v n="$NAME" 'NR==1 || $1==n'
     echo
-    sbx exec "$NAME" bash -lc '
-        for p in 8888:jupyterlab 6080:novnc 5900:xvnc 8080:burp-proxy 8081:burp-mcp; do
-            port=${p%%:*}; name=${p##*:}
-            if timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
-                printf "  %-12s %-5s up\n" "$name" "$port"
-            else
-                printf "  %-12s %-5s down\n" "$name" "$port"
-            fi
-        done' 2>/dev/null || true
+    health
+    ;;
+
+# Idempotent by design, so it is safe to run when unsure: it reports what was
+# already up instead of stacking a second supervisor on it.
+svcs)
+    require_sandbox
+    start_services
     ;;
 
 shell)   require_sandbox; exec sbx exec -it "$NAME" bash -l ;;
@@ -340,7 +457,14 @@ shell)   require_sandbox; exec sbx exec -it "$NAME" bash -l ;;
 # `-it` makes the accepting possible. Later starts return once both ports answer.
 burp)    require_sandbox; exec sbx exec -it "$NAME" /home/agent/bin/burp-start.sh ;;
 # `sbx exec <name> true` starts a stopped sandbox without spawning the agent TUI.
-wake)    exec sbx exec "$NAME" true ;;
+# It does NOT bring the services back -- see start_services for what changed in
+# sbx and why the desired state now has to be re-applied from out here -- so
+# waking is two steps, and `exec` is gone from the first one to allow a second.
+wake)
+    require_sandbox
+    sbx exec "$NAME" true
+    start_services
+    ;;
 down)    exec sbx stop "$NAME" ;;
 destroy)
     require_sandbox

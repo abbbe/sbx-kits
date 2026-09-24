@@ -161,6 +161,12 @@ setup:
     # same register as jupyter-svc.sh.  Nothing re-applies a "desired state"
     # after a stop/start cycle in this platform, so the desired state has to be
     # "always on", which for ~60MB of RSS is the right trade.
+    # AND IT ONLY RUNS ONCE, ON sbx 0.45.1.  A restart no longer re-dispatches
+    # startup commands (0.43.0 did), so a woken sandbox has no desktop at all
+    # until something starts it: `sbx-kits svcs` / `sbx-kits wake` in this repo.
+    # The restart loop below is still the right shape -- it keeps the service
+    # alive for as long as the container lives -- it just no longer gets
+    # re-armed for free when the container comes back.
     - user: "1000"
       background: true
       description: Desktop, supervised

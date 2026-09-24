@@ -152,6 +152,12 @@ setup:
   startup:
     # A single background command is not supervised — the script itself is a
     # restart loop with backoff.
+    # AND IT ONLY RUNS ONCE, ON sbx 0.45.1.  A restart no longer re-dispatches
+    # startup commands (0.43.0 did), so a woken sandbox has no JupyterLab at all
+    # until something starts it: `sbx-kits svcs` / `sbx-kits wake` in this repo.
+    # The restart loop below is still the right shape -- it keeps the service
+    # alive for as long as the container lives -- it just no longer gets
+    # re-armed for free when the container comes back.
     - user: "1000"
       background: true
       description: JupyterLab, supervised

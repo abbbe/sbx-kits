@@ -25,6 +25,7 @@ git clone https://github.com/abbbe/sbx-kits ~/.sbx/sbx-kits
 ~/.sbx/sbx-kits/bin/sbx-kits status        # sandbox state + per-service health
 ~/.sbx/sbx-kits/bin/sbx-kits urls          # URLs and token again
 ~/.sbx/sbx-kits/bin/sbx-kits shell         # a shell inside it
+~/.sbx/sbx-kits/bin/sbx-kits svcs          # restart services that are down (see Lifecycle)
 ```
 
 `up` prints the noVNC and JupyterLab URLs with the token filled in. Defaults live in
@@ -274,11 +275,31 @@ redirects nothing by itself.
 ```console
 sbx-kits down burpbox      # stop
 sbx-kits wake burpbox      # start again without spawning the Claude TUI
+sbx-kits svcs burpbox      # start whichever services are not running
 sbx-kits destroy burpbox   # remove it (host-staged Burp state is untouched)
 ```
 
-Burp does not come back by itself after a restart — run `burp-start.sh` again. The desktop and
-JupyterLab do.
+Burp does not come back by itself after a restart — run `burp-start.sh` again, or
+`sbx-kits burp burpbox`.
+
+**The desktop and JupyterLab do not come back by themselves either, as of sbx 0.45.1.** They
+used to, on 0.43.0: a kit declares each one as a `setup.startup` background command, and a
+stop/start cycle re-dispatched it. It no longer does — measured on an idle sandbox, both
+`sbx exec <name> true` and `sbx run -d --name <name>` bring the container back with a fresh
+PID 1 and no startup commands, so the sandbox comes up carrying `tini`, `sleep infinity` and
+`dockerd` and nothing else. The symptom is a sandbox that `sbx ls` calls `running` with every
+service down, and it also happens without a stop you asked for: upgrading the sbx cask
+restarts sandboxd, which takes every running container down with it.
+
+`wake` therefore starts the services as well, and `svcs` does that half on its own — for a
+sandbox that came back some other way, or after the daemon restarted underneath you. It is
+idempotent: it starts only what is not already there, so running it when unsure costs nothing.
+A second supervisor would be worse than none (both service scripts are their own restart
+loops, and the one that loses the race for the port respawns forever), so it refuses to stack
+one, and it leaves a port alone when something that is not the supervisor is holding it.
+
+Unlike the startup dispatcher, which ran these scripts with their output going nowhere, `svcs`
+gives each one a log: `~/.local/state/sbx-kits/{jupyter,desktop}-svc.log` inside the sandbox.
 
 ## Memory
 
