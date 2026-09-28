@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Make the skycell in ~/.config/skycell/endpoint.env opencode's provider and model.
+
+    skycell-opencode [--endpoint FILE] [--config FILE]
+
+`sbx-kits up` / `sbx-kits skycell` write the endpoint file and run this. It is
+what a skycell control center exports on the host, with the URLs rewritten to
+host.docker.internal and the key replaced by the proxy's placeholder:
+
+    base_url=http://host.docker.internal:18000/v1
+    model=qwen3.8-27b
+    ctx=262144
+    think=1
+    temperature=0.6
+    top_p=0.95
+    top_k=20
+    api_key=<placeholder the sandbox proxy swaps for the real key>
+
+It edits opencode.json IN PLACE: kits/opencode ships it with the MCP servers,
+and only `provider.skycell` and `model` are replaced here, so anything else in
+the file -- yours or another kit's -- survives a re-run.
+
+Everything model-shaped comes from endpoint.env: a config written for one
+model and used against another errors nowhere and just behaves worse than the
+model can. A missing key is fatal rather than defaulted, for the same reason.
+"""
+import argparse
+import json
+import os
+
+HOME = os.path.expanduser("~")
+PROVIDER = "skycell"
+
+
+def read_env(path):
+    out = {}
+    for line in open(path):
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, _, v = line.rstrip("\n").partition("=")
+            out[k.strip()] = v
+    return out
+
+
+def need(ep, key, path, conv=str):
+    v = ep.get(key, "")
+    if v == "":
+        raise SystemExit("skycell-opencode: no %s in %s" % (key, path))
+    try:
+        return conv(v)
+    except ValueError:
+        raise SystemExit("skycell-opencode: bad %s in %s: %r" % (key, path, v))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--endpoint", default=os.path.join(HOME, ".config", "skycell", "endpoint.env"))
+    ap.add_argument("--config", default=os.path.join(HOME, ".config", "opencode", "opencode.json"))
+    ap.add_argument("--max-out", type=int, default=32768, help="reply cap: the runaway guard")
+    a = ap.parse_args()
+
+    ep = read_env(a.endpoint)
+    alias = need(ep, "model", a.endpoint)
+    base = need(ep, "base_url", a.endpoint)
+    api_key = need(ep, "api_key", a.endpoint)
+    ctx = need(ep, "ctx", a.endpoint, int)
+    think = need(ep, "think", a.endpoint) == "1"
+    options = {"temperature": need(ep, "temperature", a.endpoint, float),
+               "top_p": need(ep, "top_p", a.endpoint, float),
+               "top_k": need(ep, "top_k", a.endpoint, int)}
+    max_out = min(a.max_out, ctx // 4) if a.max_out >= ctx else a.max_out
+    options["max_tokens"] = max_out
+
+    doc = {"$schema": "https://opencode.ai/config.json"}
+    if os.path.exists(a.config):
+        # A file that does not parse is refused, not replaced: it holds the
+        # MCP servers and whatever else was put there.
+        try:
+            doc = json.load(open(a.config))
+        except ValueError as e:
+            raise SystemExit("skycell-opencode: %s is not JSON (%s) -- not overwriting it" % (a.config, e))
+    doc.setdefault("provider", {})[PROVIDER] = {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "skycell",
+        "options": {
+            "baseURL": base.rstrip("/"),
+            "apiKey": api_key,
+            # A long prompt on a big context can sit in prefill for minutes on
+            # a cold cache; opencode's defaults are shorter.
+            "headerTimeout": 600000,
+            "chunkTimeout": 600000,
+        },
+        "models": {
+            alias: {
+                "name": "%s%s" % (alias, " (thinking)" if think else ""),
+                "tool_call": True,
+                "reasoning": think,
+                "temperature": True,
+                # Must match the server's per-request context: opencode fills
+                # whatever it is told it has.
+                "limit": {"context": ctx, "output": max_out},
+                "options": options,
+            }
+        },
+    }
+    doc["model"] = "%s/%s" % (PROVIDER, alias)
+
+    os.makedirs(os.path.dirname(a.config), exist_ok=True)
+    tmp = a.config + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(doc, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, a.config)
+    print("opencode: %s/%s at %s, ctx %d, max_out %d, %s" % (
+        PROVIDER, alias, base, ctx, max_out, "thinking" if think else "no thinking"))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,51 @@
+schemaVersion: "2"
+kind: mixin
+name: sbx-skycell
+version: "0.1.0"
+displayName: skycell
+description: The team's skycell LLM server, reached through this machine's control-center tunnel, as opencode's model.
+requires:
+  agent: claude
+
+# MOST OF THIS KIT IS IN THE WRAPPER, and has to be. A skycell control center
+# publishes its tunnel on the host's loopback, on a port that is per person,
+# and exports what it serves to ~/.config/skycell (endpoint.env + key) -- all
+# host-side facts, read at the time, which a kit spec cannot express:
+#
+#   - the network rule for that port (a kit's allowlist is static);
+#   - the key swap: `sbx secret set-custom` runs `cat <export>/key` ON THE HOST
+#     and the proxy puts the output into requests, so the key never enters
+#     the sandbox;
+#   - the endpoint description, copied in as ~/.config/skycell/endpoint.env
+#     with the URLs rewritten to host.docker.internal and api_key= set to the
+#     proxy's placeholder.
+#
+# `sbx-kits up` does all three when this kit is in --kits, and `sbx-kits
+# skycell NAME` redoes them (see skycell_connect in bin/sbx-kits). What is left
+# for the kit is the part that runs inside: skycell-opencode, which turns that
+# endpoint.env into opencode's provider.
+#
+# No permissions block: the only thing it reaches is the host port, and that
+# rule is per sandbox, added by the wrapper.
+
+setup:
+  install:
+    # chmod +x is load-bearing: files/ entries arrive 0644 whatever their mode
+    # on disk, and an unexecutable script fails with Permission denied.
+    - user: "0"
+      description: skycell-opencode permissions
+      command: |
+        set -e
+        chown agent:agent /home/agent/bin /home/agent/bin/skycell-opencode
+        chmod +x /home/agent/bin/skycell-opencode
+
+agentInstructions:
+  content: |
+    ## skycell
+
+    The team's LLM server is described in `~/.config/skycell/endpoint.env`
+    (base_url, model, ctx, sampling; embed_base_url when it has an embedding
+    model). It is OpenAI-compatible. The api_key there is a placeholder that
+    the sandbox proxy replaces with the real key on the way out: use it as-is,
+    and never go looking for the real one. opencode, when installed, has it as
+    the `skycell` provider.

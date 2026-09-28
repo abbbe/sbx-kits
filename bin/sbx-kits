@@ -57,6 +57,10 @@ BURP_MCP_PKG=""
 PORT_JUPYTER=8888
 PORT_NOVNC=6080
 PORT_BURP=18080          # host side; the sandbox listener is always 8080
+# Kit groups: a name in --kits that is not a kit expands to its group, so
+# `--kits pentest,foo` works.  One level: a group lists kits, not groups.
+# Define your own in the config file below, e.g. KIT_GROUP_nb=jupyter,opencode
+KIT_GROUP_pentest="jupyter,desktop,burp,opencode,skycell"
 
 # ~/.config/sbx-kits/config is sourced if present: plain KEY=value bash, so
 # `MEMORY=12g` or `KITS=jupyter,desktop` there beats retyping flags.
@@ -78,12 +82,14 @@ Commands:
   burp [NAME]      Start Burp, attached to this terminal (first run needs it)
   svcs [NAME]      Start the supervised services that are not running
   wake [NAME]      Start a stopped sandbox and its services, without the Claude TUI
+  skycell [NAME]   (Re)connect the sandbox to the skycell: after the cell, its
+                   port or its model changed, or when none was up at 'up'
   down [NAME]      Stop the sandbox
   destroy [NAME]   Remove the sandbox (host-staged Burp state is NOT touched)
 
 Options (for 'up'):
   --workspace DIR    Project directory to mount    (default: \$PWD)
-  --kits LIST        Comma-separated              (default: $KITS)
+  --kits LIST        Comma-separated kits and groups (default: $KITS)
   --burp-root DIR    Burp staging root            (default: $BURP_ROOT)
   --memory SIZE      Sandbox memory               (default: $MEMORY)
   --cpus N           Sandbox CPUs                 (default: sbx's own)
@@ -94,8 +100,11 @@ Options (for 'up'):
   --burp-mcp-pkg SPEC    Burp MCP server as an npm spec (wins over --burp-mcp-src)
   --dry-run          Print the sbx command instead of running it
 
+Kit groups: $(set | sed -n 's/^KIT_GROUP_\([A-Za-z0-9_]*\)=/  \1 = /p' | tr -d "'")
+
 NAME defaults to the sandbox mounting $PWD (for 'up': the directory name).
 Config file: $CONFIG
+skycell: reads \${SKYCELL_EXPORT:-~/.config/skycell}, as the control center writes it.
 EOF
 }
 
@@ -127,6 +136,31 @@ while [ $# -gt 0 ]; do
 done
 
 WORKSPACE="$(cd "$WORKSPACE" 2>/dev/null && pwd)" || die "no such directory: $WORKSPACE"
+
+# --- kit groups --------------------------------------------------------------
+# Expanded once, here, so everything below -- has_kit included -- sees kits
+# only.  In place rather than echoed: a die inside $(...) would only leave the
+# subshell.  Order is kept and repeats dropped, so a group plus one of its own
+# kits does not pass --kit twice.
+expand_kits() {
+    local out="," k g members m
+    for k in ${KITS//,/ }; do
+        if [ -d "$REPO/kits/$k" ]; then
+            members="$k"
+        else
+            case "$k" in *[!A-Za-z0-9_]*) die "no kit or group named '$k'" ;; esac
+            g="KIT_GROUP_$k"
+            members="${!g:-}"
+            [ -n "$members" ] || die "no kit or group named '$k' -- kits: $(ls "$REPO/kits" | tr '\n' ' ')"
+        fi
+        for m in ${members//,/ }; do
+            [ -d "$REPO/kits/$m" ] || die "group '$k' lists '$m', which is not a kit (groups do not nest)"
+            case "$out" in *",$m,"*) ;; *) out="$out$m," ;; esac
+        done
+    done
+    out="${out#,}"; KITS="${out%,}"
+}
+expand_kits
 
 # --- finding the sandbox ---------------------------------------------------
 # WITHOUT A NAME, RESOLVE BY WORKSPACE, NOT BY DIRECTORY NAME.  Guessing
@@ -178,6 +212,10 @@ $(printf '%s\n' "$all" | sed 's/^/    /')
 }
 
 has_kit() { case ",$KITS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+# The kits that read the shared token and publish a port.  `sbx run` refuses a
+# --kit-arg that no kit in the composition declares, so a sandbox of only
+# kits/opencode must not be handed one.
+has_token_kit() { has_kit jupyter || has_kit desktop || has_kit burp; }
 
 # --- the shared token ------------------------------------------------------
 # Kept per sandbox name, on the host, so `urls` can answer without execing into
@@ -212,13 +250,13 @@ pick_port() {
 }
 
 print_urls() {
+    has_token_kit || return 0
     load_token
-    cat <<EOF
-
-  noVNC       http://127.0.0.1:$PORT_NOVNC/vnc.html?resize=remote   password: $(printf '%s' "$TOKEN" | cut -c1-8)
-  JupyterLab  http://127.0.0.1:$PORT_JUPYTER/lab?token=$TOKEN
-EOF
+    echo
+    has_kit desktop && echo "  noVNC       http://127.0.0.1:$PORT_NOVNC/vnc.html?resize=remote   password: $(printf '%s' "$TOKEN" | cut -c1-8)"
+    has_kit jupyter && echo "  JupyterLab  http://127.0.0.1:$PORT_JUPYTER/lab?token=$TOKEN"
     has_kit burp && echo "  Burp proxy  127.0.0.1:$PORT_BURP  (sandbox-side listener is 8080)"
+    has_kit desktop || return 0
     cat <<EOF
 
 The VNC password is the FIRST 8 CHARACTERS only -- the RFB protocol truncates it
@@ -244,7 +282,17 @@ health() {
             else
                 printf "  %-12s %-5s down\n" "$name" "$port"
             fi
-        done' 2>/dev/null || true
+        done
+        # The skycell, probed the way opencode reaches it: through the proxy,
+        # with the placeholder the proxy swaps for the key.
+        f=$HOME/.config/skycell/endpoint.env
+        if [ -r "$f" ]; then
+            u=$(sed -n "s/^base_url=//p" "$f"); k=$(sed -n "s/^api_key=//p" "$f")
+            p=${u#http://*:}; p=${p%%/*}
+            c=$(curl -s -m 5 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $k" "$u/models")
+            if [ "$c" = 200 ]; then st=up; else st="down (HTTP $c)"; fi
+            printf "  %-12s %-5s %s\n" skycell "$p" "$st"
+        fi' 2>/dev/null || true
 }
 
 # --- starting the supervised services --------------------------------------
@@ -345,6 +393,129 @@ start_services() {
     health
 }
 
+# --- skycell: the team's LLM server, through this machine's tunnel -----------
+# kits/skycell holds the part that runs inside; this is the part that has to
+# happen on the host, at the time, and so cannot be in a kit.  A skycell
+# control center publishes its ssh tunnel on the host's loopback and exports
+# what it serves to ${SKYCELL_EXPORT:-~/.config/skycell}: endpoint.env
+# (base_url model ctx think temperature top_p top_k, optional embed_base_url)
+# and key.  The same variable and default the control center itself uses, so
+# there is nothing to configure here.
+#
+#   THE PORT.  Egress is default-deny, and a kit's allowlist is static and read
+#   at create -- but the port is per person and can change under a running
+#   sandbox.  So it is a per-sandbox rule, and the name that rule needs is not
+#   the one in the URL: the sandbox reaches the host as host.docker.internal,
+#   and the proxy rewrites that to localhost BEFORE matching.  Measured on sbx
+#   0.45.1: allowing host.docker.internal:18000 still gets "Blocked by network
+#   policy: domain localhost:18000"; allowing localhost:18000 works.
+#
+#   THE KEY.  It never enters the sandbox.  `sbx secret set-custom` stores a
+#   command that reads the key file ON THE HOST, and the proxy swaps a fixed
+#   placeholder for its output in requests to the named host.  Measured: the
+#   secret has to be bound to localhost, not host.docker.internal (the same
+#   rewrite); it works over plain http; and it is re-read per request, so a
+#   key that changes when the cell does is picked up with nothing re-run.
+#
+#   THE DESCRIPTION.  endpoint.env names 127.0.0.1, which inside the sandbox is
+#   the sandbox.  It is copied in to the same path, ~/.config/skycell/
+#   endpoint.env, with the URLs rewritten to host.docker.internal and api_key=
+#   set to the placeholder; kits/skycell's skycell-opencode then makes it
+#   opencode's provider.
+#
+# `sbx rm` takes the rule and the secret with the sandbox.  A rule for a port
+# you have since moved off is left behind: it allows a port nothing listens on.
+SKYCELL_DIR="${SKYCELL_EXPORT:-$HOME/.config/skycell}"
+SKYCELL_PLACEHOLDER="sbx-kits-skycell-key-via-proxy"
+
+# Sets LP to the port of a host-loopback http URL, or dies.  Sets a variable
+# rather than printing, because `p=$(f)` with a die inside f only exits the
+# $(...) subshell.
+loopback_port() {   # $1 key  $2 url  $3 file
+    case "$2" in
+        http://127.0.0.1:*/*|http://localhost:*/*) ;;
+        *) die "$1=$2 in $3: only http://127.0.0.1:PORT/... is handled -- a tunnel on this machine's loopback" ;;
+    esac
+    LP="${2#http://*:}"; LP="${LP%%/*}"
+    case "$LP" in ''|*[!0-9]*) die "$1=$2 in $3: no port in it" ;; esac
+}
+
+skycell_connect() {
+    local ep="$SKYCELL_DIR/endpoint.env" key="$SKYCELL_DIR/key" base embed model ports p out code tmp verified=1
+    [ -r "$ep" ] || die "no $ep -- attach the control center to a cell first: ./cc cell up"
+    [ -s "$key" ] || die "no key at $key"
+    base="$(sed -n 's/^base_url=//p' "$ep")"
+    embed="$(sed -n 's/^embed_base_url=//p' "$ep")"
+    model="$(sed -n 's/^model=//p' "$ep")"
+    [ -n "$base" ] || die "no base_url in $ep"
+    [ -n "$model" ] || die "no model in $ep"
+    loopback_port base_url "$base" "$ep"; ports="$LP"; local chat_port="$LP"
+    if [ -n "$embed" ]; then loopback_port embed_base_url "$embed" "$ep"; ports="$ports $LP"; fi
+
+    # A cell that has idled out is the normal case between sessions, and
+    # nothing below needs it: the rule and the key swap are about the port and
+    # the key file, the opencode config about endpoint.env -- the last cell's,
+    # kept until the control center learns that cell is gone.  So set up
+    # anyway, and skip only the one check that needs a live server, saying so.
+    # The next cell usually serves the same profile on the same port, and the
+    # proxy re-reads the key per request, so it then works with nothing re-run;
+    # a different model needs `sbx-kits skycell` again.
+    code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "${base%/v1}/health" || true)"
+    if [ "$code" != 200 ]; then
+        verified=0
+        echo "sbx-kits: WARNING: nothing healthy at ${base%/v1}/health on this machine (HTTP $code) -- setting up from $ep without checking it through the sandbox"
+    fi
+
+    for p in $ports; do
+        if ! sbx policy check network --sandbox "$NAME" "localhost:$p" >/dev/null 2>&1; then
+            out="$(sbx policy allow network --sandbox "$NAME" "localhost:$p" 2>&1)" \
+                || die "could not allow localhost:$p for $NAME: $out"
+        fi
+    done
+    out="$(sbx secret set-custom --sandbox "$NAME" --host localhost \
+               --placeholder "$SKYCELL_PLACEHOLDER" --command "cat $(printf '%q' "$key")" 2>&1)" \
+        || die "could not store the key swap for $NAME: $out"
+
+    tmp="$(mktemp)"
+    sed -E -e 's#^(base_url|embed_base_url)=http://(127\.0\.0\.1|localhost):#\1=http://host.docker.internal:#' \
+           -e '/^api_key=/d' "$ep" > "$tmp"
+    printf 'api_key=%s\n' "$SKYCELL_PLACEHOLDER" >> "$tmp"
+    sbx exec -i "$NAME" sh -c 'mkdir -p "$HOME/.config/skycell" && cat > "$HOME/.config/skycell/endpoint.env"' < "$tmp" \
+        || { rm -f "$tmp"; die "could not write endpoint.env into $NAME"; }
+    rm -f "$tmp"
+
+    # From inside, through the proxy, with the placeholder: the path opencode
+    # takes.  Each failure has one cause, so say which.
+    [ "$verified" = 1 ] || ports=""
+    for p in $ports; do
+        code="$(sbx exec "$NAME" curl -s -m 20 -o /dev/null -w '%{http_code}' \
+                    -H "Authorization: Bearer $SKYCELL_PLACEHOLDER" "http://host.docker.internal:$p/v1/models" || true)"
+        case "$code" in
+            200) ;;
+            403) die "$NAME: the proxy blocks localhost:$p (sbx policy check network --sandbox $NAME localhost:$p)" ;;
+            401) die "$NAME: port $p answers but refuses the key -- $key is not the cell's key, or the proxy did not swap it in (sbx secret ls)" ;;
+            *)   die "$NAME: port $p via host.docker.internal: HTTP ${code:-none}" ;;
+        esac
+    done
+
+    if sbx exec "$NAME" sh -c 'command -v opencode >/dev/null && test -x "$HOME/bin/skycell-opencode"'; then
+        sbx exec "$NAME" /home/agent/bin/skycell-opencode || die "skycell-opencode failed in $NAME"
+        out="$(sbx exec "$NAME" opencode models skycell 2>&1 || true)"
+        case "$out" in
+            *"skycell/$model"*) ;;
+            *) die "opencode in $NAME does not list skycell/$model: $out" ;;
+        esac
+    else
+        echo "sbx-kits: no opencode in $NAME; ~/.config/skycell/endpoint.env is there for other tools"
+    fi
+    if [ "$verified" = 1 ]; then
+        echo "sbx-kits: $NAME -> skycell/$model on this machine's port $chat_port, key swapped in by the proxy"
+    else
+        echo "sbx-kits: $NAME -> skycell/$model on this machine's port $chat_port, NOT verified (no cell answering)."
+        echo "  After ./cc cell up: sbx-kits status $NAME shows it; if the cell serves another model, sbx-kits skycell $NAME"
+    fi
+}
+
 case "$CMD" in
 up)
     sandbox_exists && die "sandbox '$NAME' already exists and mounts this workspace.
@@ -376,8 +547,10 @@ up)
                    --kit-arg "sbx-burp.state=$BURP_ROOT/state")
     fi
 
-    load_token
-    KIT_ARGS+=(--kit-arg "token=$TOKEN")
+    if has_token_kit; then
+        load_token
+        KIT_ARGS+=(--kit-arg "token=$TOKEN")
+    fi
     # Namespaced, unlike token=: jupyter_mcp_pkg is declared by sbx-jupyter alone, and
     # an unqualified --kit-arg is offered to every kit in the composition.
     # Skipped entirely when empty so the spec's own default stays the default.
@@ -389,9 +562,15 @@ up)
         [ -n "$BURP_MCP_PKG" ] && KIT_ARGS+=(--kit-arg "sbx-burp.burp_mcp_pkg=$BURP_MCP_PKG")
     fi
 
-    PORT_JUPYTER=$(pick_port "$PORT_JUPYTER")
-    PORT_NOVNC=$(pick_port "$PORT_NOVNC")
-    PUBLISH=(-p "$PORT_JUPYTER:8888" -p "$PORT_NOVNC:6080")
+    PUBLISH=()
+    if has_kit jupyter; then
+        PORT_JUPYTER=$(pick_port "$PORT_JUPYTER")
+        PUBLISH+=(-p "$PORT_JUPYTER:8888")
+    fi
+    if has_kit desktop; then
+        PORT_NOVNC=$(pick_port "$PORT_NOVNC")
+        PUBLISH+=(-p "$PORT_NOVNC:6080")
+    fi
     if has_kit burp; then
         PORT_BURP=$(pick_port "$PORT_BURP")
         PUBLISH+=(-p "$PORT_BURP:8080")
@@ -406,18 +585,25 @@ up)
     # (`--kits desktop`, the very path someone using only this repo's desktop
     # would take) died with "MOUNTS[@]: unbound variable" before printing
     # anything useful.  The +alternate form expands to nothing when the array is
-    # empty instead of erroring.  Same reasoning would apply to KIT_ARGS and
-    # PUBLISH if either could ever be empty; neither can, so both are left plain.
+    # empty instead of erroring.  KIT_ARGS cannot be empty (every sandbox has a
+    # kit), so it is left plain; PUBLISH can, and gets the same treatment below.
     CMDLINE=(sbx run --detached claude --name "$NAME" "$WORKSPACE"
              ${MOUNTS[@]+"${MOUNTS[@]}"}
              "${KIT_ARGS[@]}" -m "$MEMORY")
     [ -n "$CPUS" ] && CMDLINE+=(--cpus "$CPUS")
-    CMDLINE+=("${PUBLISH[@]}")
+    # +alternate for the same reason as MOUNTS: a sandbox of only kits/opencode
+    # publishes nothing, and an empty array is unbound under set -u in bash 3.2.
+    CMDLINE+=(${PUBLISH[@]+"${PUBLISH[@]}"})
 
     if [ "$DRY_RUN" = 1 ]; then printf '%q ' "${CMDLINE[@]}"; echo; exit 0; fi
 
     echo "sbx-kits: creating '$NAME' with kits: $KITS"
     "${CMDLINE[@]}"
+    # Not fatal here: the sandbox exists either way, and a cell that is not
+    # up yet is the normal case.  The subshell is what lets die stop only this.
+    if has_kit skycell; then
+        ( skycell_connect ) || echo "sbx-kits: skycell NOT connected (above) -- once the cell is up: sbx-kits skycell $NAME"
+    fi
     print_urls
     if has_kit burp; then
         cat <<EOF
@@ -432,6 +618,11 @@ EOF
 urls)
     require_sandbox
     print_urls
+    ;;
+
+skycell)
+    require_sandbox
+    skycell_connect
     ;;
 
 status)

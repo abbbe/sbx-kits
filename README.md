@@ -1,6 +1,6 @@
-# sbx-kits: JupyterLab, a desktop, and Burp Suite Pro
+# sbx-kits: JupyterLab, a desktop, Burp Suite Pro, OpenCode, and skycell
 
-Three mixin kits for [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`),
+Five mixin kits for [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`),
 composed onto the stock `claude` agent. Each one works alone; together they give a sandbox
 where Claude drives Burp over MCP, you watch and click the real Burp GUI in a browser, and
 JupyterLab is there for scripting.
@@ -10,6 +10,8 @@ JupyterLab is there for scripting.
 | [`kits/jupyter`](kits/jupyter) | JupyterLab with RTC + `jupyter-mcp-server` over stdio | 8888 | automatically |
 | [`kits/desktop`](kits/desktop) | TigerVNC (Xvnc) + fluxbox + noVNC, resizes to the browser | 6080 | automatically |
 | [`kits/burp`](kits/burp) | Burp Suite Pro + a Burp MCP server ([`burp-mcp-bridge`](https://github.com/fwaeytens/burp-mcp-bridge) by default) | 8080 | on demand |
+| [`kits/opencode`](kits/opencode) | OpenCode next to Claude, with the jupyter and burp MCP servers | -- | `sbx exec -it NAME opencode` |
+| [`kits/skycell`](kits/skycell) | Your team's [skycell](https://github.com/abbbe/skycell) LLM server as opencode's model | -- | -- |
 
 Kits are composed at **create** time — `sbx kit add` on a running sandbox silently skips
 `ports:` and `volumes:`, so a kit added later has nothing published.
@@ -40,6 +42,80 @@ a kit cannot read the mount table, so each staged path has to be passed twice. I
 passes `--detached`, without which the sandbox stops 30 seconds after the last session
 disconnects, and it shifts off a busy host port rather than letting `sbx run` fail the whole
 create with a 409.
+
+## Kit groups
+
+A name in `--kits` that is not a kit is a group, and expands to its kits:
+
+| group | kits |
+|---|---|
+| `pentest` | `jupyter,desktop,burp,opencode,skycell` |
+
+Add your own in `~/.config/sbx-kits/config`, e.g. `KIT_GROUP_nb=jupyter,opencode,skycell`.
+Groups mix with kits (`--kits nb,desktop`), a kit listed twice is passed once, and a group lists
+kits, not other groups. `sbx-kits --help` prints the groups defined.
+
+## OpenCode, on your team's skycell
+
+`kits/opencode` installs the latest [OpenCode](https://opencode.ai) into the claude sandbox, so
+you have both. It ships `~/.config/opencode/opencode.json` with the `jupyter` and `burp` MCP
+servers, the same stdio wrappers those kits give Claude. Both are listed even when their kit
+isn't in the sandbox; an absent one shows as a failed MCP server and nothing worse.
+
+`kits/skycell` makes a [skycell](https://github.com/abbbe/skycell) cell opencode's model,
+through your control center's ssh tunnel:
+
+```console
+sbx-kits up --kits pentest                 # or --kits opencode,skycell
+sbx exec -it <name> opencode
+sbx-kits skycell <name>                    # after the cell, its port or its model changed
+```
+
+There is nothing to configure. The wrapper reads what the control center exports on every
+attach, from `${SKYCELL_EXPORT:-~/.config/skycell}` (the same variable and default the control
+center uses):
+
+| file | contents |
+|---|---|
+| `endpoint.env` | `base_url=http://127.0.0.1:PORT/v1`, `model`, `ctx`, `think`, `temperature`, `top_p`, `top_k`; `embed_base_url` if the cell has one |
+| `key` | the bearer key |
+
+What it sets up, per sandbox, is host-side and read at the time, so it lives in the wrapper
+rather than in the kit:
+- **One network rule per port.** The sandbox gets `localhost:PORT` for the chat and embedding
+  ports, and nothing else on your machine. The sandbox reaches the host as
+  `host.docker.internal`, but the proxy rewrites that to `localhost` *before* it matches rules,
+  so that is the name the rule needs. Allowing `host.docker.internal:PORT` still gets
+  `Blocked by network policy: domain localhost:PORT` (measured, sbx 0.45.1).
+- **The key never enters the sandbox.** `sbx secret set-custom` stores `cat <export>/key` as a
+  command that sandboxd runs on the host. The proxy then replaces a fixed placeholder with its
+  output in requests to `localhost`. This works over plain http, the secret has to be bound to
+  `localhost` for the same reason as the rule, and the key is re-read per request, so a new key
+  (a new cell) needs nothing re-run.
+- **`~/.config/skycell/endpoint.env` inside the sandbox.** This is the same file with the URLs
+  rewritten to `host.docker.internal` and `api_key=` set to the placeholder. The kit's
+  `skycell-opencode` then adds a `skycell` provider to `opencode.json` and makes it the default
+  model. It edits in place, replacing only `provider.skycell` and `model`; the MCP servers and
+  anything you added survive.
+
+It then checks, and stops with the cause if any check fails:
+- the tunnel is healthy on this machine;
+- `/v1/models` answers 200 from *inside* the sandbox, through the proxy, with the placeholder
+  (403: the rule is missing; 401: the key is wrong or wasn't swapped in);
+- `opencode models` lists the model.
+
+If no cell is answering (it idled out), everything is still set up from the last cell's
+`endpoint.env`, and only the through-the-sandbox check is skipped, with a warning. The next
+`./cc cell up` then works with nothing re-run, as long as it serves the same model: the proxy
+re-reads the key per request. If it serves a different model, run `sbx-kits skycell <name>` again.
+With no `endpoint.env` at all, the sandbox is still created and `sbx-kits skycell <name>`
+connects it later. `sbx-kits status` shows the same probe as a `skycell` line. `sbx rm` removes the rule and
+the secret. A rule for a port you've moved off stays until then; it allows a port nothing listens
+on.
+
+The stock `docker.io/sbx/opencode-kit` can't do this. It is a *sandbox* kit named `opencode`,
+which is a built-in agent, so `sbx create` refuses it ("built-in agents cannot be overridden by a
+kit"). Being a sandbox kit, it is the agent, so it could never sit next to Claude anyway.
 
 ## Everything, including Burp
 

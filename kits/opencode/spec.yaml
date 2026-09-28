@@ -1,0 +1,59 @@
+schemaVersion: "2"
+kind: mixin
+name: sbx-opencode
+version: "0.1.0"
+displayName: OpenCode
+description: OpenCode next to Claude, with this repo's MCP servers registered.
+requires:
+  agent: claude
+
+# WHY A MIXIN AND NOT docker.io/sbx/opencode-kit.  That kit is kind: sandbox
+# and named `opencode`, which is a built-in agent: `sbx create` refuses it
+# outright ("built-in agents cannot be overridden by a kit").  And a sandbox kit
+# is the agent, so it could never sit next to Claude anyway.  This one adds the
+# binary to a claude sandbox; `sbx exec -it <name> opencode` runs it.
+#
+# Which model it talks to is not this kit's business: kits/skycell adds a
+# provider to the same opencode.json, and without it opencode offers whatever
+# its own /connect flow sets up.
+
+# The complete outbound contract for this kit.
+#
+# registry.npmjs.org twice over: the install below, and at runtime, because
+# opencode fetches each provider's SDK package (e.g. @ai-sdk/openai-compatible)
+# from npm the first time it is used, and updates itself from there. Without it
+# the first prompt fails with a package-install error, not a policy one.
+#
+# opencode.ai and its subdomains: the model catalog (models.opencode.ai) and
+# the config schema. Unreachable, the catalog falls back to a snapshot built
+# into the binary, so this is freshness rather than function.
+permissions:
+  network:
+    allow:
+      - registry.npmjs.org:443
+      - opencode.ai:443
+      - "*.opencode.ai:443"
+
+setup:
+  install:
+    # npm, not the curl|bash installer: the claude template ships node and npm,
+    # and it lands on the PATH of every user rather than in one user's home.
+    - user: "0"
+      description: opencode-ai (latest)
+      command: |
+        set -e
+        npm install -g --no-fund --no-audit opencode-ai
+        opencode --version
+    # files/home/.config/opencode/opencode.json registers the jupyter and burp
+    # MCP servers -- the same stdio wrappers kits/jupyter and kits/burp give
+    # Claude. They are listed whether or not those kits are in this sandbox:
+    # an absent one shows as a failed MCP server in opencode, nothing worse.
+    # Files arrive root-owned; opencode and kits/skycell write this one. The
+    # parent too, when this copy is what created it: otherwise nothing else
+    # can make a directory under ~/.config.
+    - user: "0"
+      description: opencode config ownership
+      command: |
+        set -e
+        chown agent:agent /home/agent/.config
+        chown -R agent:agent /home/agent/.config/opencode

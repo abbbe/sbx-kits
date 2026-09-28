@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "jupyter": {
+      "type": "local",
+      "command": ["/home/agent/bin/jupyter-mcp.sh"],
+      "enabled": true
+    },
+    "burp": {
+      "type": "local",
+      "command": ["/home/agent/bin/burp-mcp.sh"],
+      "enabled": true
+    }
+  }
+}
