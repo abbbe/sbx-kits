@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# browser [--via-burp] [--proxy HOST:PORT] [--profile DIR] [--fg] [URL...]
+#
+# The HUMAN's Chromium, on the virtual desktop.  The agent's browser is a
+# different process on a different profile, driven by the Playwright MCP server
+# -- see playwright-mcp.sh, and BROWSER_PROFILE/BROWSER_MCP_PROFILE in
+# spec.yaml for why those two must never be the same directory.
+#
+# THERE IS NO CHROMIUM PACKAGE ON THIS SYSTEM AND THAT IS NOT AN OVERSIGHT.
+# Ubuntu's `chromium` and `firefox` debs have been transitional snap stubs since
+# 22.04: apt installs them happily and then the launcher execs snapd, which no
+# container has.  Google publishes no arm64 Linux Chrome deb at all, so on an
+# Apple Silicon host that route is closed too.  What this kit runs instead is the
+# Chrome for Testing build Playwright downloads -- a real Chromium, built for
+# linux-arm64 and linux-x64 both, and the SAME BINARY the MCP server drives, so
+# a page that renders for the human renders for the agent.
+#
+# DETACHED BY DEFAULT, WITH A HEALTH CHECK, because this script has two callers
+# that want opposite things.  From a shell (or from the agent) the useful
+# behaviour is to return promptly; from the fluxbox menu there is no terminal to
+# return to and a failure would otherwise be perfectly silent -- the menu item
+# "does nothing", which is the single most confusing way for this to break.  So:
+# start it, watch it for a moment, and report a stillbirth through whichever
+# channel exists (stderr if there is a tty, an xmessage dialog if there is not).
+set -uo pipefail
+
+: "${DISPLAY:=:1}"
+export DISPLAY
+# WAYLAND_DISPLAY MUST GO.  The sandbox exports WAYLAND_DISPLAY=wayland-0 into
+# every process; Chromium reads it as proof of a Wayland session and, with
+# --ozone-platform unset, will try to talk Wayland to something that is not
+# there rather than looking at $DISPLAY.  Same lie that cost the desktop kit an
+# evening on x11vnc -- see desktop-svc.sh.
+unset WAYLAND_DISPLAY
+export XDG_SESSION_TYPE=x11
+
+# EXPORTED, not merely assigned: the resolver below is a `node -e` that reads
+# process.env.PLAYWRIGHT_ROOT, so a bare assignment would leave it undefined in
+# the child whenever the kit's own environment block is not in play -- running
+# this script by hand, or from a sandbox built without it. The symptom is
+# silent: require("undefined/node_modules/...") throws, the glob fallback takes
+# over, and the failure only surfaces if that misses too.
+export PLAYWRIGHT_ROOT="${PLAYWRIGHT_ROOT:-/opt/playwright}"
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$PLAYWRIGHT_ROOT/browsers}"
+STATE="${BROWSER_STATE:-$HOME/.local/state/browser}"
+PROFILE="${BROWSER_PROFILE:-$STATE/profile}"
+LOG="$STATE/browser.log"
+BURP_CRT=/usr/local/share/ca-certificates/burp.crt
+BURP_PROXY="127.0.0.1:${BURP_PROXY_PORT:-8080}"
+
+PROXY=""
+FOREGROUND=0
+URLS=()
+
+die() {
+    # A dialog when there is no terminal to print to -- the fluxbox menu case.
+    # xmessage comes from x11-utils, which the desktop kit installs; without a
+    # desktop there is no menu to be called from either, so the fallback to
+    # stderr alone is exactly right.
+    echo "browser: $*" >&2
+    if [[ ! -t 2 ]] && command -v xmessage >/dev/null 2>&1; then
+        xmessage -center -timeout 60 "browser: $*" >/dev/null 2>&1 &
+    fi
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: browser [options] [URL...]
+
+Options:
+  --via-burp        Route through Burp (127.0.0.1:8080) and trust its CA
+  --proxy HOST:PORT Route through an explicit HTTP proxy
+  --profile DIR     Use another profile directory (a second window needs one)
+  --fg              Stay in the foreground instead of detaching
+  -h, --help        This
+
+The agent's browser is separate and is driven over MCP; this one is yours.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --via-burp) PROXY="http://$BURP_PROXY"; VIA_BURP=1; shift ;;
+        --proxy) PROXY="${2:?--proxy needs HOST:PORT}"; shift 2
+                 [[ $PROXY == *://* ]] || PROXY="http://$PROXY" ;;
+        --profile) PROFILE="${2:?--profile needs a directory}"; shift 2 ;;
+        --fg) FOREGROUND=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; URLS+=("$@"); break ;;
+        -*) die "unknown option: $1 (try --help)" ;;
+        *) URLS+=("$1"); shift ;;
+    esac
+done
+
+mkdir -p "$STATE" "$PROFILE"
+
+# Playwright's own resolver rather than a glob, because it is the thing that
+# knows both the revision it downloaded and this machine's platform directory
+# (chrome-linux-arm64/chrome here, chrome-linux64/chrome on x86).  The glob is
+# the fallback for the case where the node half is broken but the browser is
+# fine, which is worth surviving.
+EXE=$(node -e 'console.log(require(process.env.PLAYWRIGHT_ROOT + "/node_modules/playwright-core").chromium.executablePath())' 2>/dev/null)
+if [[ ! -x ${EXE:-} ]]; then
+    EXE=$(ls -1 "$PLAYWRIGHT_BROWSERS_PATH"/chromium-*/chrome-linux*/chrome 2>/dev/null | head -1)
+fi
+[[ -x ${EXE:-} ]] || die "no Chromium under $PLAYWRIGHT_BROWSERS_PATH.
+  The kit downloads it at create; to repair it by hand:
+    PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH $PLAYWRIGHT_ROOT/node_modules/.bin/playwright install chromium"
+
+# --- Burp ------------------------------------------------------------------
+# CHROMIUM DOES NOT READ /etc/ssl/certs.  burp-start.sh installs Burp's CA into
+# the system bundle, which is what curl and python then trust -- and Chromium
+# ignores all of it, because NSS keeps its own database in ~/.pki/nssdb.  So the
+# same CA has to be added a second time, in the other format, or every proxied
+# page is an interstitial.  certutil is libnss3-tools, installed by this kit.
+#
+# The database is per USER and not per profile, so this survives --profile and
+# is done once; -A on an already-present nickname is a no-op.
+if [[ -n ${VIA_BURP:-} ]]; then
+    [[ -s $BURP_CRT ]] || die "no Burp CA at $BURP_CRT.
+  Burp writes it on its first start: run burp-start.sh first (and check the
+  burp kit is composed into this sandbox at all)."
+    if command -v certutil >/dev/null 2>&1; then
+        db="sql:$HOME/.pki/nssdb"
+        mkdir -p "$HOME/.pki/nssdb"
+        [[ -f $HOME/.pki/nssdb/cert9.db ]] || certutil -d "$db" -N --empty-password >/dev/null 2>&1
+        certutil -d "$db" -A -t "C,," -n "PortSwigger CA (sbx)" -i "$BURP_CRT" >/dev/null 2>&1 \
+            || echo "browser: could not add Burp's CA to $db; expect TLS interstitials" >&2
+    else
+        echo "browser: certutil not found; expect TLS interstitials on proxied HTTPS" >&2
+    fi
+fi
+
+# --- flags -----------------------------------------------------------------
+# THERE IS DELIBERATELY NO --no-sandbox HERE, which is worth stating because
+#   every Chromium-in-Docker recipe on the internet passes it.  Measured in a
+#   live sandbox, on the running browser this script starts: every --type=
+#   renderer has Seccomp: 2 in /proc/<pid>/status -- seccomp-bpf engaged -- and
+#   sits in a user namespace distinct from the browser process's
+#   (4026533318 against 4026531837).  The namespace sandbox is therefore fully
+#   working here, which figures: max_user_namespaces is 32313 and `unshare
+#   --user --map-root-user` succeeds.
+#   Disabling it would trade away the browser's own privilege separation -- the
+#   thing standing between a hostile page's renderer and the rest of this
+#   sandbox -- for nothing.  Note Playwright DOES disable it for the
+#   chrome-for-testing channel by default; that is its portability choice for
+#   hosts where the namespace is unavailable, not a statement about this one.
+# --disable-dev-shm-usage: /dev/shm is 64M here (measured: `df -h /dev/shm`),
+#   and Chromium puts renderer shared memory there.  Busy pages then die as
+#   "Aw, Snap" with nothing in the log that names the cause.  Moves it to /tmp.
+# The --disable-*-networking family: egress is default-deny, so Chromium's
+#   component updater, variations service and phishing-list fetches all fail --
+#   loudly and repeatedly.  Measured on a first launch: a stream of
+#   `handshake failed ... net_error -202` retries that slow startup and bury
+#   anything real in browser.log.  None of them do anything useful in a sandbox
+#   that cannot reach Google in the first place.
+# --disable-search-engine-choice-screen / --no-first-run: the EU choice dialog
+#   and the welcome tour are modal on a fresh profile, and on a VNC desktop
+#   somebody else is watching that is just noise.
+ARGS=(
+    --user-data-dir="$PROFILE"
+    --disable-dev-shm-usage
+    --disable-background-networking
+    --disable-component-update
+    --disable-sync
+    --disable-domain-reliability
+    --disable-client-side-phishing-detection
+    --no-first-run
+    --no-default-browser-check
+    --disable-search-engine-choice-screen
+    --start-maximized
+)
+[[ -n $PROXY ]] && ARGS+=(--proxy-server="$PROXY")
+
+if [ ${#URLS[@]} -gt 0 ]; then ARGS+=("${URLS[@]}"); fi
+
+if [ "$FOREGROUND" = 1 ]; then
+    exec "$EXE" "${ARGS[@]}"
+fi
+
+# --- detached, with a health check -----------------------------------------
+# setsid so the browser outlives the shell or the menu [exec] that started it.
+: > "$LOG"
+setsid "$EXE" "${ARGS[@]}" >>"$LOG" 2>&1 &
+pid=$!
+
+# A SECOND INSTANCE ON THE SAME PROFILE EXITS 0, AND THAT IS SUCCESS.  Chromium
+# does not open a second window of its own; it hands the command line to the
+# process already holding the profile lock and returns immediately.  So a clean
+# exit here means "the URL went to the window that is already open", and only a
+# non-zero one is a failure.  Distinguishing them is the whole reason this waits
+# at all.
+for _ in $(seq 1 12); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.25
+done
+
+if kill -0 "$pid" 2>/dev/null; then
+    echo "browser: started (pid $pid, profile $PROFILE)${PROXY:+, proxy $PROXY}"
+    echo "browser: log $LOG"
+    exit 0
+fi
+
+wait "$pid"; rc=$?
+if [ "$rc" = 0 ]; then
+    echo "browser: handed to the window already open on $PROFILE"
+    exit 0
+fi
+die "Chromium exited rc=$rc. Last lines of $LOG:
+$(tail -n 12 "$LOG" 2>/dev/null)"

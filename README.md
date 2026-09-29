@@ -1,14 +1,15 @@
-# sbx-kits: JupyterLab, a desktop, Burp Suite Pro, OpenCode, and skycell
+# sbx-kits: JupyterLab, a desktop, a browser, Burp Suite Pro, OpenCode, and skycell
 
-Five mixin kits for [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`),
+Six mixin kits for [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`),
 composed onto the stock `claude` agent. Each one works alone; together they give a sandbox
-where Claude drives Burp over MCP, you watch and click the real Burp GUI in a browser, and
-JupyterLab is there for scripting.
+where Claude drives Burp and a real browser over MCP, you watch and click both GUIs from
+your own browser, and JupyterLab is there for scripting.
 
 | kit | what it adds | port | starts |
 |---|---|---|---|
 | [`kits/jupyter`](kits/jupyter) | JupyterLab with RTC + `jupyter-mcp-server` over stdio | 8888 | automatically |
 | [`kits/desktop`](kits/desktop) | TigerVNC (Xvnc) + fluxbox + noVNC, resizes to the browser | 6080 | automatically |
+| [`kits/browser`](kits/browser) | Chromium on the desktop + [`@playwright/mcp`](https://github.com/microsoft/playwright-mcp) over stdio | — | on demand |
 | [`kits/burp`](kits/burp) | Burp Suite Pro + a Burp MCP server ([`burp-mcp-bridge`](https://github.com/fwaeytens/burp-mcp-bridge) by default) | 8080 | on demand |
 | [`kits/opencode`](kits/opencode) | OpenCode next to Claude, with the jupyter and burp MCP servers | -- | `sbx exec -it NAME opencode` |
 | [`kits/skycell`](kits/skycell) | Your team's [skycell](https://github.com/abbbe/skycell) LLM server as opencode's model | -- | -- |
@@ -49,7 +50,7 @@ A name in `--kits` that is not a kit is a group, and expands to its kits:
 
 | group | kits |
 |---|---|
-| `pentest` | `jupyter,desktop,burp,opencode,skycell` |
+| `pentest` | `jupyter,desktop,browser,burp,opencode,skycell` |
 
 Add your own in `~/.config/sbx-kits/config`, e.g. `KIT_GROUP_nb=jupyter,opencode,skycell`.
 Groups mix with kits (`--kits nb,desktop`), a kit listed twice is passed once, and a group lists
@@ -227,6 +228,84 @@ have run and add the mapping yourself, loopback-only:
 macOS's own Screen Sharing.app will connect but will not resize — it does not send
 SetDesktopSize. A TigerVNC or RealVNC viewer does.
 
+## A browser on the desktop, and the same one over MCP
+
+`kits/browser` puts **Web Browser** in the desktop's Applications menu and registers
+`@playwright/mcp` as a stdio MCP server. Both drive the *same Chromium binary*, so a page
+that renders for you renders for Claude.
+
+There is no `chromium` package on the system, and that is not an oversight. Ubuntu's
+`chromium` and `firefox` debs have been transitional **snap stubs** since 22.04 — apt installs
+them happily and the launcher then execs `snapd`, which no container has. Google publishes no
+arm64 Linux Chrome deb at all, so on an Apple Silicon host that route is closed too. What this
+kit runs instead is the **Chrome for Testing** build Playwright downloads: a real Chromium,
+built for `linux-arm64` and `linux-x64` both. Playwright 1.64 carries a first-class
+`ubuntu26.04-arm64` target, so this is a supported combination rather than a lucky one.
+
+**The agent's browser is headed by default**, on `$DISPLAY`, so whoever is watching noVNC sees
+the page Claude is on. `playwright-mcp.sh` waits up to 30s for the X server before deciding —
+the MCP server is spawned at session start and the desktop is a background command racing it,
+and choosing headless one second too early is invisible: no error, just a human staring at an
+empty desktop while the agent reports pages loading. With no desktop kit composed in it goes
+straight to headless and everything else is the same.
+
+**Your browser and the agent's are different processes on different profiles**, and they have
+to be: Chromium takes an exclusive lock on a user-data-dir, and a second launch against the
+same one does not open a window, it hands its command line to the running instance and exits.
+Sharing a profile would mean whichever started second silently became a tab in the first.
+So logins do not carry across — that is the cost of both of you browsing at once.
+
+```console
+browser                                   # your Chromium, on the desktop
+browser https://target.example.com/       # …at a URL
+browser --via-burp https://target/        # …through Burp, trusting its CA
+browser --profile ~/p2                    # a genuinely second window
+```
+
+`--via-burp` does something the burp kit cannot do for you: **Chromium does not read
+`/etc/ssl/certs`.** `burp-start.sh` installs Burp's CA into the system bundle, which is what
+`curl` and `python` then trust, and Chromium ignores all of it because NSS keeps its own
+database in `~/.pki/nssdb`. So the same CA has to be added a second time, in the other format,
+or every proxied page is an interstitial. For the agent's browser, put
+`--proxy-server=http://127.0.0.1:8080` in `$PLAYWRIGHT_MCP_ARGS` and reconnect with `/mcp`.
+
+### Chromium keeps its own sandbox here
+
+Every Chromium-in-Docker recipe passes `--no-sandbox`. This one does not, because it does not
+need to: measured on the running browser, every `--type=renderer` has `Seccomp: 2` in
+`/proc/<pid>/status` and sits in a user namespace distinct from the browser process's, and
+`unshare --user --map-root-user` succeeds. The renderer's privilege separation is the thing
+standing between a hostile page and the rest of the sandbox, and there is no reason to trade it
+away. (Playwright *does* disable it for the `chrome-for-testing` channel, so the MCP browser
+runs without it regardless — that is Playwright's portability default for hosts where the
+namespace is unavailable, not a statement about this one.)
+
+Two flags that are not optional: `--disable-dev-shm-usage`, because `/dev/shm` is 64M in a
+container and busy pages otherwise die as "Aw, Snap" with nothing in the log naming the cause;
+and the `--disable-*-networking` family, because under default-deny egress Chromium's component
+updater and variations service retry blocked endpoints forever and bury anything real in
+`browser.log`.
+
+### Pinning it, or running a fork
+
+One coordinate fixes both halves — the package pins an exact `playwright`, and the Chromium
+downloaded at create is the revision that `playwright` names:
+
+```console
+sbx-kits up --playwright-mcp-pkg '@playwright/mcp@0.0.81'
+sbx-kits up --playwright-mcp-pkg 'github:you/playwright-mcp#<sha>'
+```
+
+`PLAYWRIGHT_MCP_PKG=` in `~/.config/sbx-kits/config` is the better home for a fork you are
+living on. As with the other kits, `permissions.network.allow` is static and read at create
+time, so a source outside npm and GitHub needs `kits/browser/spec.yaml` edited as well.
+
+The kit costs about **680 MB** installed — `playwright install chromium` fetches the headless
+shell and ffmpeg alongside the browser. `--kit-arg sbx-browser.browsers='chromium firefox
+webkit'` gets the other two engines for Playwright scripts, at roughly 500 MB more; note
+Playwright's firefox and webkit are *patched* builds that nothing but Playwright can drive, and
+neither is wired into the menu entry.
+
 ## One token
 
 There is a single secret per sandbox at `/home/agent/.sbx-token`. Whichever kit's install step
@@ -374,9 +453,10 @@ credentials in the proxy history. Opt in per command instead:
 via-burp curl -sS https://target.example.com/
 ```
 
-In JupyterLab, pick the **Python 3 (via Burp)** kernel. Burp's CA is installed system-wide by
-`burp-start.sh`; that is safe precisely *because* there is no global proxy — trusting a CA
-redirects nothing by itself.
+In JupyterLab, pick the **Python 3 (via Burp)** kernel. In the browser, `browser --via-burp`
+— which also has to add Burp's CA to Chromium's NSS database, because Chromium does not read
+the system bundle at all. Burp's CA is installed system-wide by `burp-start.sh`; that is safe
+precisely *because* there is no global proxy — trusting a CA redirects nothing by itself.
 
 ## Lifecycle
 
@@ -393,7 +473,9 @@ sandbox, which is what stops one engagement's history surfacing in the next. Onl
 to keep first.
 
 Burp does not come back by itself after a restart — run `burp-start.sh` again, or
-`sbx-kits burp burpbox`, and pick a project again.
+`sbx-kits burp burpbox`, and pick a project again. Neither does the browser, and
+nothing needs to bring it back: it is started by you from the menu, and by Claude on its first
+`browser_*` tool call.
 
 **The desktop and JupyterLab do not come back by themselves either, as of sbx 0.45.1.** They
 used to, on 0.43.0: a kit declares each one as a `setup.startup` background command, and a

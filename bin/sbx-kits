@@ -38,7 +38,7 @@ STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/sbx-kits"
 # Defaults, overridable per-invocation or from the config file below.
 NAME=""
 WORKSPACE="$PWD"
-KITS="jupyter,desktop,burp"
+KITS="jupyter,desktop,browser,burp"
 BURP_ROOT="$HOME/.sbx/burp"
 MEMORY="8g"
 CPUS=""
@@ -53,13 +53,18 @@ JUPYTER_MCP_PKG=""
 # upstream publishes, and wins over BURP_MCP_SRC when set.
 BURP_MCP_SRC=""
 BURP_MCP_PKG=""
+# Empty means "whatever kits/browser/spec.yaml pins", which is a released
+# @playwright/mcp. Note this one choice fixes the BROWSER too: the package pins
+# an exact playwright, and the Chromium downloaded at create is the revision
+# that playwright names.
+PLAYWRIGHT_MCP_PKG=""
 PORT_JUPYTER=8888
 PORT_NOVNC=6080
 PORT_BURP=18080          # host side; the sandbox listener is always 8080
 # Kit groups: a name in --kits that is not a kit expands to its group, so
 # `--kits pentest,foo` works.  One level: a group lists kits, not groups.
 # Define your own in the config file below, e.g. KIT_GROUP_nb=jupyter,opencode
-KIT_GROUP_pentest="jupyter,desktop,burp,opencode,skycell"
+KIT_GROUP_pentest="jupyter,desktop,browser,burp,opencode,skycell"
 
 # ~/.config/sbx-kits/config is sourced if present: plain KEY=value bash, so
 # `MEMORY=12g` or `KITS=jupyter,desktop` there beats retyping flags.
@@ -97,6 +102,7 @@ Options (for 'up'):
   --burp-mcp-src OWNER/REPO@REF
                      Burp MCP server source; match stage-burp.sh --burp-mcp-src
   --burp-mcp-pkg SPEC    Burp MCP server as an npm spec (wins over --burp-mcp-src)
+  --playwright-mcp-pkg SPEC  Playwright MCP server npm spec (default: the pinned release)
   --dry-run          Print the sbx command instead of running it
 
 Kit groups: $(set | sed -n 's/^KIT_GROUP_\([A-Za-z0-9_]*\)=/  \1 = /p' | tr -d "'")
@@ -128,6 +134,7 @@ while [ $# -gt 0 ]; do
         --jupyter-mcp-pkg) JUPYTER_MCP_PKG="${2:?}"; shift 2 ;;
         --burp-mcp-src) BURP_MCP_SRC="${2:?}"; shift 2 ;;
         --burp-mcp-pkg) BURP_MCP_PKG="${2:?}"; shift 2 ;;
+        --playwright-mcp-pkg) PLAYWRIGHT_MCP_PKG="${2:?}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
@@ -562,6 +569,9 @@ up)
     if has_kit burp; then
         [ -n "$BURP_MCP_SRC" ] && KIT_ARGS+=(--kit-arg "sbx-burp.burp_mcp_src=$BURP_MCP_SRC")
         [ -n "$BURP_MCP_PKG" ] && KIT_ARGS+=(--kit-arg "sbx-burp.burp_mcp_pkg=$BURP_MCP_PKG")
+    fi
+    if [ -n "$PLAYWRIGHT_MCP_PKG" ] && has_kit browser; then
+        KIT_ARGS+=(--kit-arg "sbx-browser.playwright_mcp_pkg=$PLAYWRIGHT_MCP_PKG")
     fi
 
     PUBLISH=()

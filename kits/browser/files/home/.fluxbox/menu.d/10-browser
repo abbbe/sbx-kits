@@ -1,0 +1,16 @@
+# The browser in the desktop's Applications menu. A fragment, not a whole menu:
+# the outer [begin]/[end] and the Applications submenu belong to kits/desktop,
+# which parses every file in this directory in alphabetical order. Nothing
+# breaks when the desktop kit is absent -- there is then no fluxbox to read it.
+#
+# 10, ahead of the burp kit's 20, because this is the entry someone opens
+# casually and Burp is the one they open deliberately.
+#
+# NOT WRAPPED IN xterm, unlike the Burp entry, and the difference is real rather
+# than stylistic: burp-start.sh's first run is a console conversation that
+# blocks on stdin, whereas this never needs input. What a menu [exec] cannot do
+# is report a failure -- fluxbox does not notice a failed exec, so a broken
+# entry is silently inert -- which is why `browser` detaches, watches the
+# process for three seconds, and raises an xmessage dialog when it finds no
+# terminal to complain to.
+[exec] (Web Browser) {/home/agent/bin/browser}
