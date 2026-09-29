@@ -11,7 +11,7 @@ your own browser, and JupyterLab is there for scripting.
 | [`kits/desktop`](kits/desktop) | TigerVNC (Xvnc) + fluxbox + noVNC, resizes to the browser | 6080 | automatically |
 | [`kits/browser`](kits/browser) | Chromium on the desktop + [`@playwright/mcp`](https://github.com/microsoft/playwright-mcp) over stdio | — | on demand |
 | [`kits/burp`](kits/burp) | Burp Suite Pro + a Burp MCP server ([`burp-mcp-bridge`](https://github.com/fwaeytens/burp-mcp-bridge) by default) | 8080 | on demand |
-| [`kits/opencode`](kits/opencode) | OpenCode next to Claude, with the jupyter and burp MCP servers | -- | `sbx exec -it NAME opencode` |
+| [`kits/opencode`](kits/opencode) | OpenCode next to Claude, with the jupyter, burp and playwright MCP servers | -- | `sbx exec -it NAME opencode` |
 | [`kits/skycell`](kits/skycell) | Your team's [skycell](https://github.com/abbbe/skycell) LLM server as opencode's model | -- | -- |
 
 Kits are composed at **create** time — `sbx kit add` on a running sandbox silently skips
@@ -59,9 +59,11 @@ kits, not other groups. `sbx-kits --help` prints the groups defined.
 ## OpenCode, on your team's skycell
 
 `kits/opencode` installs the latest [OpenCode](https://opencode.ai) into the claude sandbox, so
-you have both. It ships `~/.config/opencode/opencode.json` with the `jupyter` and `burp` MCP
-servers, the same stdio wrappers those kits give Claude. Both are listed even when their kit
-isn't in the sandbox; an absent one shows as a failed MCP server and nothing worse.
+you have both. It ships `~/.config/opencode/opencode.json` with the `jupyter`, `burp` and
+`playwright` MCP servers, the same stdio wrappers those kits give Claude. All three are listed
+even when their kit isn't in the sandbox; an absent one shows as a failed MCP server and nothing
+worse. OpenCode's `playwright` browses on its own profile (`~/.local/state/browser/opencode-profile`),
+so it and Claude can each drive a browser at the same time.
 
 `kits/skycell` makes a [skycell](https://github.com/abbbe/skycell) cell opencode's model,
 through your control center's ssh tunnel:
@@ -253,7 +255,9 @@ straight to headless and everything else is the same.
 to be: Chromium takes an exclusive lock on a user-data-dir, and a second launch against the
 same one does not open a window, it hands its command line to the running instance and exits.
 Sharing a profile would mean whichever started second silently became a tab in the first.
-So logins do not carry across — that is the cost of both of you browsing at once.
+So logins do not carry across — that is the cost of both of you browsing at once. With
+`kits/opencode` there is a third: OpenCode's Playwright server gets a profile of its own, for
+the same reason.
 
 ```console
 browser                                   # your Chromium, on the desktop

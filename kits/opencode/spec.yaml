@@ -44,10 +44,17 @@ setup:
         set -e
         npm install -g --no-fund --no-audit opencode-ai
         opencode --version
-    # files/home/.config/opencode/opencode.json registers the jupyter and burp
-    # MCP servers -- the same stdio wrappers kits/jupyter and kits/burp give
-    # Claude. They are listed whether or not those kits are in this sandbox:
-    # an absent one shows as a failed MCP server in opencode, nothing worse.
+    # files/home/.config/opencode/opencode.json registers the jupyter, burp and
+    # playwright MCP servers -- the same stdio wrappers kits/jupyter, kits/burp
+    # and kits/browser give Claude. They are listed whether or not those kits
+    # are in this sandbox: an absent one shows as a failed MCP server in
+    # opencode, nothing worse.
+    #
+    # PLAYWRIGHT GETS ITS OWN PROFILE, through BROWSER_MCP_PROFILE in that
+    # file. Claude and opencode each spawn their own copy of the server, and
+    # Chromium locks a user-data-dir: on the shared default, whichever client
+    # browsed second would fail to launch its browser. See kits/browser's
+    # TWO PROFILES comment -- with opencode it is three.
     # Files arrive root-owned; opencode and kits/skycell write this one. The
     # parent too, when this copy is what created it: otherwise nothing else
     # can make a directory under ~/.config.
