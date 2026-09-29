@@ -137,8 +137,8 @@ other code path and ships the arm64 Chromium (verified: `ELF 64-bit ARM aarch64`
 plus PortSwigger's own JRE, which also silences the "your JRE appears to be … from Ubuntu"
 warning. `--jar` still works as a fallback and warns about the browser.
 
-The install runs unattended on first `burp-start.sh`, into `state/burp-install` — about 950 MB,
-paid once, and it survives `sbx rm` with the rest of the state mount.
+The install runs unattended on first `burp-start.sh`, into `~/.local/share/burp/install` **inside
+the sandbox** — about 950 MB and a few minutes, paid once per sandbox, and gone when you remove it.
 
 Then create the sandbox and do the one interactive step:
 
@@ -149,8 +149,40 @@ sbx exec -it burpbox /home/agent/bin/burp-start.sh   # first run: EULA, then lic
 
 Burp's first run is a console conversation, not a GUI wizard: it prints the EULA and blocks on
 stdin, so it needs a terminal — that is why the command above uses `sbx exec -it`.
-`dist/license.key` is at the same path inside the sandbox, so you can `cat` it there and paste. After that the activation lives in `state/java` on the host
-and survives `sbx rm`.
+`dist/license.key` is at the same path inside the sandbox, so you can `cat` it there and paste.
+
+Answering those prompts spends a licence **activation**, and activations are finite. Do it once,
+then copy the answers back to the host so every later sandbox starts already licensed:
+
+```console
+./kits/burp/stage-burp.sh --harvest burpbox   # -> ~/.sbx/burp/dist/prefs.xml
+```
+
+That file is **copied into** each new sandbox at create — never mounted — so no sandbox can
+change what the next one starts from. Burp's CA is stripped on the way out (`prune-prefs.py`):
+each sandbox mints its own, rather than sharing one CA private key across every engagement.
+
+### Nothing writable is shared between sandboxes
+
+`~/.sbx/burp/dist` is the only mount and it is `:ro`. Everything Burp writes — its preferences,
+its installation, its logs, and any project file you create — lives inside one sandbox and dies
+with it.
+
+It was not always so, and the bug is worth recording. There used to be a second mount,
+`~/.sbx/burp/state`, read-write and pointed at one host directory by every sandbox at once, with
+`burp-start.sh` passing `--project-file=$BURP_STATE/project.burp`. Consequences:
+
+- **A new sandbox opened the previous engagement's proxy history**, sitemap and Repeater tabs,
+  and wrote its own traffic into the same file. Cross-engagement data bleed by default: any
+  sandbox could read every other sandbox's captured traffic.
+- **The Burp installation was shared and writable.** ~950 MB of executable code that every
+  sandbox launched and any one of them could rewrite.
+- **Two sandboxes up at once** contended for the same project file's lock.
+
+Which project to open is now nobody's decision but yours: `burp-start.sh` passes no
+`--project-file`, so Burp shows its own project dialog on the desktop and waits. Nothing binds
+port 8080 until you choose, and `burp-start.sh` says so and exits 0 rather than reporting a
+failure.
 
 ## The desktop follows your browser window
 
@@ -352,11 +384,16 @@ redirects nothing by itself.
 sbx-kits down burpbox      # stop
 sbx-kits wake burpbox      # start again without spawning the Claude TUI
 sbx-kits svcs burpbox      # start whichever services are not running
-sbx-kits destroy burpbox   # remove it (host-staged Burp state is untouched)
+sbx-kits destroy burpbox   # remove it, and everything Burp wrote in it
 ```
 
+`destroy` now takes Burp's project files, preferences and installation with it — they live in the
+sandbox, which is what stops one engagement's history surfacing in the next. Only the host-staged
+`~/.sbx/burp/dist` (Burp itself, the licence key, `prefs.xml`) survives. Harvest anything you want
+to keep first.
+
 Burp does not come back by itself after a restart — run `burp-start.sh` again, or
-`sbx-kits burp burpbox`.
+`sbx-kits burp burpbox`, and pick a project again.
 
 **The desktop and JupyterLab do not come back by themselves either, as of sbx 0.45.1.** They
 used to, on 0.43.0: a kit declares each one as a `setup.startup` background command, and a

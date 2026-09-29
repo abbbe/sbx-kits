@@ -17,8 +17,39 @@
 set -uo pipefail
 
 DIST=${BURP_DIST:-/opt/burp/dist}
-STATE=${BURP_STATE:-/opt/burp/state}
 JAR="$DIST/burpsuite_pro.jar"
+
+# EVERYTHING WRITABLE IS CONTAINER-LOCAL, AND THAT IS THE POINT.  $DIST is a
+# read-only mount of host-staged artefacts and it is the ONLY thing this kit
+# shares between sandboxes.
+#
+# It did not used to be.  There was a second mount, $BURP_STATE, read-write and
+# pointed at ONE host directory by every sandbox at once, holding the Java
+# preferences, the unpacked Burp installation and a single project.burp.  Three
+# things followed, all bad:
+#
+#   * ONE PROJECT FILE FOR EVERY ENGAGEMENT.  A brand-new sandbox opened the
+#     previous target's proxy history, sitemap and Repeater tabs, and wrote its
+#     own traffic back into the same file.  Cross-engagement data bleed by
+#     default, and any sandbox could read every other sandbox's captured
+#     traffic.
+#   * A WRITABLE, SHARED BURP INSTALLATION.  ~950MB of executable code, mounted
+#     read-write into every sandbox, and launched by all of them.  Anything that
+#     got code execution in one sandbox could rewrite the Burp that every other
+#     sandbox then ran.
+#   * A LOCK FIGHT.  Two sandboxes up at once contended for the same project
+#     file.
+#
+# So there is no state mount now.  Preferences, the installation, logs and the
+# rendered configs all live under $HOME, inside this container, and die with it.
+# What survives a recreate is what the HOST staged into $DIST -- and it survives
+# by being COPIED IN at create (see spec.yaml), never by being mounted writable.
+STATE="${BURP_STATE:-$HOME/.local/state/burp}"
+
+# Burp's Java preferences: the EULA acceptance, the licence, the activation
+# record and Burp's CA.  Container-local, seeded at create from
+# $DIST/prefs.xml when the host staged one.
+PREFS_ROOT="$HOME/.java"
 
 # PIN JAVA 21 IF IT IS THERE.  The kit installs openjdk-21-jre, but the base
 # template already carries openjdk-25, which wins the `java` alternative -- and
@@ -62,13 +93,13 @@ port_open() { timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
 # its bundled JRE, so the launcher's own name is gone from argv by the time
 # anything can look for it.  Measured on a live sandbox, with Burp holding both
 # ports, the process is:
-#   .../state/burp-install/jre/bin/java -splash:.../.install4j/... --add-opens ...
+#   .../burp/install/jre/bin/java -splash:.../.install4j/... --add-opens ...
 # and BOTH old patterns scored zero.  So the one guard whose job is to stop a
 # second Burp never fired for an installer-based Burp at all.
 #
 # Contending for the port is the actual failure mode, so test the port.  pgrep
 # survives only to name a pid in the message, with the install directory this
-# script itself chooses ($STATE/burp-install) added to the pattern.  The
+# script itself chooses ($INSTALL_DIR) added to the pattern.  The
 # brackets stop pgrep matching the shell running this very script, whose own
 # command line would otherwise contain the pattern.
 if port_open "$PROXY_PORT"; then
@@ -97,24 +128,23 @@ On the host, once -- prefer the platform installer, which is the only flavour
 that carries Burp's embedded browser for this architecture:
     ./kits/burp/stage-burp.sh --installer /path/to/burpsuite_pro_linux_arm64_v2026_8.sh
 
-Then recreate the sandbox with BOTH the mounts and the matching kit args, e.g.
+Then recreate the sandbox with the mount and the matching kit arg, e.g.
     sbx run --detached claude --name burpbox . \\
-        \$HOME/.sbx/burp/dist:ro \$HOME/.sbx/burp/state \\
+        \$HOME/.sbx/burp/dist:ro \\
         --kit .../kits/jupyter --kit .../kits/desktop --kit .../kits/burp \\
         --kit-arg sbx-burp.dist=\$HOME/.sbx/burp/dist \\
-        --kit-arg sbx-burp.state=\$HOME/.sbx/burp/state \\
         -m 8g -p 8888:8888 -p 6080:6080 -p 8080:8080
 
 An additional workspace mounts at its IDENTICAL host path, and the kit has no
 way to read the mount table -- which is why the same path is typed twice.
+$DIST is mounted :ro and there is no second, writable mount: nothing this
+sandbox does to Burp can reach another sandbox.
 
-Currently: BURP_DIST=$DIST  BURP_STATE=$STATE
+Currently: BURP_DIST=$DIST
 EOF
     exit 1
 fi
-[ -d "$STATE" ] || die "state directory $STATE does not exist (mount it read-write)"
-[ -w "$STATE" ] || die "state directory $STATE is not writable (do not mount it :ro)"
-mkdir -p "$STATE/java" || die "cannot create $STATE/java"
+mkdir -p "$STATE" || die "cannot create $STATE"
 
 # --- 2b. Prefer a PortSwigger installation over the standalone jar ---------
 # THE STANDALONE JAR HAS NO BROWSER ON THIS ARCHITECTURE.  Measured: the jar's
@@ -133,9 +163,27 @@ mkdir -p "$STATE/java" || die "cannot create $STATE/java"
 # directory) and DO ship the arm64 build.  They also bundle PortSwigger's own
 # JRE, which is what silences "Your JRE appears to be version ... from Ubuntu".
 #
-# So: if an installer has been staged, use it.  The install lands on the STATE
-# mount, so it is paid for once ever rather than once per sandbox.
-INSTALL_DIR="$STATE/burp-install"
+# So: if an installer has been staged, use it.
+#
+# THE INSTALL LANDS INSIDE THIS CONTAINER, AND IT IS PAID FOR ONCE PER SANDBOX.
+# It used to land on the shared read-write state mount, which made it free after
+# the first sandbox -- and also made ~950MB of executable code writable by every
+# sandbox and executed by all of them.  That trade is not worth it: a few
+# minutes and ~950MB at first start buys an installation no other sandbox can
+# touch.  Use --jar staging instead if you would rather not pay it; the jar runs
+# straight off the read-only mount, at the cost of Burp's embedded browser on
+# arm64.
+#
+# WHAT THE ~950MB ACTUALLY IS, measured on an installed v2026.8 arm64 tree:
+#   641MB  burpbrowser/<version>/   Burp's embedded Chromium
+#   154MB  burpsuite.jar            Burp itself
+#   141MB  jre/                     PortSwigger's bundled JRE
+# All three are identical byte-for-byte across sandboxes built from the same
+# installer, so the duplication is a candidate for block-level dedup on the host
+# (or a shared READ-ONLY layer) rather than for another writable shared mount.
+# Deliberately not done here: a GB per sandbox is the cheap side of that trade,
+# and nothing writable goes back to being shared to save it.
+INSTALL_DIR="$HOME/.local/share/burp/install"
 INSTALLER="$DIST/burp-installer.sh"
 
 # The install drops BurpSuite, BurpSuite.vmoptions and a .desktop file side by
@@ -164,12 +212,12 @@ fi
 if resolve_launcher; then
     # An install4j launcher takes JVM options from INSTALL4J_ADD_VM_PARAMS, not
     # from its argv, and uses the JRE bundled beside it rather than $JAVA.
-    export INSTALL4J_ADD_VM_PARAMS="-XX:MaxRAMPercentage=50 -Djava.util.prefs.userRoot=$HOME/.java -Dawt.useSystemAAFontSettings=on -Dswing.aatext=true"
+    export INSTALL4J_ADD_VM_PARAMS="-XX:MaxRAMPercentage=50 -Djava.util.prefs.userRoot=$PREFS_ROOT -Dawt.useSystemAAFontSettings=on -Dswing.aatext=true"
     BURP=("$LAUNCHER")
 elif [ -f "$JAR" ]; then
     BURP=("$JAVA"
           -XX:MaxRAMPercentage=50
-          -Djava.util.prefs.userRoot="$HOME/.java"
+          -Djava.util.prefs.userRoot="$PREFS_ROOT"
           -Dawt.useSystemAAFontSettings=on -Dswing.aatext=true
           -jar "$JAR")
     echo "[burp-start] using the standalone jar; Burp's embedded browser will not" >&2
@@ -177,18 +225,26 @@ elif [ -f "$JAR" ]; then
     echo "[burp-start]   stage-burp.sh --installer <burpsuite_pro_linux_arm64_*.sh>" >&2
 fi
 
-# --- 3. Point the Java preferences store at the persistent mount ----------
-# Belt and braces on purpose.  The launch line passes
-# -Djava.util.prefs.userRoot, and $HOME/.java is symlinked at the same place:
-# if the JRE honours the property it writes through the symlink, and if it
-# ignores the property the JDK default IS $HOME/.java.  Either road lands in
-# the mount, which is what makes the LICENCE ACTIVATION, the EULA acceptance
-# and Burp's CA survive `sbx rm` -- activations are a finite resource and
-# re-activating on every sandbox recreate eventually hits a support ticket.
-if [ -e "$HOME/.java" ] && [ ! -L "$HOME/.java" ]; then
-    die "$HOME/.java exists and is not a symlink; move it aside first"
+# --- 3. The Java preferences store ----------------------------------------
+# A PLAIN DIRECTORY IN THIS CONTAINER.  It was a symlink to the shared state
+# mount, which is how the EULA acceptance and the licence activation survived
+# `sbx rm` -- and also how every sandbox came to share one CA private key and
+# one set of Burp preferences.
+#
+# What survives a recreate now is whatever the host staged: spec.yaml copies
+# $DIST/prefs.xml in at create, so the EULA and the activation arrive already
+# answered without anything being mounted writable.  Activations are a finite
+# resource, so if this sandbox is the one that activates, harvest it back to the
+# host afterwards and every later sandbox starts already licensed:
+#
+#     kits/burp/stage-burp.sh --harvest <sandbox-name>
+#
+# The launch line still passes -Djava.util.prefs.userRoot at the same path the
+# JDK would default to, so it lands here whether or not the JRE honours it.
+if [ -L "$PREFS_ROOT" ]; then
+    die "$PREFS_ROOT is a symlink (a leftover of the old shared state mount); remove it"
 fi
-ln -sfn "$STATE/java" "$HOME/.java"
+mkdir -p "$PREFS_ROOT"
 
 # --- 4. Wait for the display ----------------------------------------------
 # This bounded wait, and the message under it, ARE the entire dependency
@@ -203,11 +259,17 @@ xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 || die \
     "no X display on $DISPLAY after 30s -- was this sandbox created with --kit .../kits/desktop ?"
 
 # --- 5. Seed the configs, once, into the writable state -------------------
-# BURP WRITES THESE FILES BACK.  Whatever you change in the GUI is saved to the
-# path given by --user-config-file / --config-file when Burp exits, which is
-# why they must be the copies under $STATE and never the kit's own seeds (nor
-# anything under $DIST, which is mounted read-only: Burp would fail to save
-# mid-session and silently lose the extension registration).
+# BURP WRITES THE USER CONFIG BACK.  Whatever you change in the GUI is saved to
+# the path given by --user-config-file when Burp exits, which is why it must be
+# the copy under $STATE and never the kit's own seed (nor anything under $DIST,
+# which is mounted read-only: Burp would fail to save mid-session and silently
+# lose the extension registration).
+#
+# ONLY THE USER CONFIG IS PASSED ON THE LAUNCH LINE.  project-config.json is
+# rendered here and then left alone: it is a PROJECT option set, and which
+# project this sandbox opens is your call, made in Burp's own project dialog
+# (see step 7).  Select it there under "Load from configuration file" if you
+# want it; its path is printed at the end of this script.
 #
 # The upside of that write-back is that it makes this kit self-improving: set
 # something in the GUI once, then `stage-burp.sh --reseed` copies the result
@@ -293,36 +355,46 @@ done
 # and the only evidence was 70KB of licence text in the log. That is why this
 # refuses to detach on a first run instead of reproducing that silence.
 #
-# Once accepted, `burp.eula` lands in the prefs store -- which lives on the
-# state mount -- so this branch is taken exactly once per staging directory,
-# not once per sandbox.
+# Once accepted, `burp.eula` lands in the prefs store.  That store is
+# container-local now, so WITHOUT a staged $DIST/prefs.xml this branch is taken
+# once per sandbox -- and each of those runs spends one licence activation.
+# Answer the prompts in the first sandbox, then
+#     kits/burp/stage-burp.sh --harvest <sandbox-name>
+# copies the answers to the host, and every later sandbox has them copied in at
+# create and starts detached and silent.
 # DO NOT HARDCODE THE PREFS PATH.  An earlier version probed
-# $HOME/.java/.userPrefs/burp/prefs.xml, which is where the JDK default and
+# $PREFS_ROOT/.userPrefs/burp/prefs.xml, which is where the JDK default and
 # -Djava.util.prefs.userRoot both say it should be -- and it is where the
-# INSTALLER's own prefs land ($STATE/java/.userPrefs/com/install4j/...).  Burp
+# INSTALLER's own prefs land ($PREFS_ROOT/.userPrefs/com/install4j/...).  Burp
 # itself writes ONE LEVEL DEEPER: measured, the accepted EULA is at
-# $STATE/java/.java/.userPrefs/burp/prefs.xml, so the two JVMs involved disagree
-# about the root and the hardcoded path matched neither reliably.
+# $PREFS_ROOT/.java/.userPrefs/burp/prefs.xml, so the two JVMs involved disagree
+# about the root and the hardcoded path matched neither reliably.  That is also
+# why stage-burp.sh --harvest finds the file by grepping for burp.eula rather
+# than by path, and why spec.yaml seeds it at the deeper of the two.
 #
 # The cost of getting this wrong is invisible and permanent: the probe fails
 # forever, so EVERY start takes the interactive first-run branch below, sits in
 # the foreground streaming Burp's log to the terminal, and waits for an EULA
 # prompt that will never come because Burp is already licensed.  Searching the
 # prefs tree for the key is immune to which root the JRE picked.
-if ! grep -rq --include=prefs.xml 'burp\.eula' "$HOME/.java" 2>/dev/null; then
+if ! grep -rq --include=prefs.xml 'burp\.eula' "$PREFS_ROOT" 2>/dev/null; then
     if [ ! -t 0 ]; then
         cat >&2 <<EOF
-burp-start: this is Burp's first run against $STATE/java, and it will ask you to
+burp-start: this is Burp's first run against $PREFS_ROOT, and it will ask you to
 accept the EULA (and then for your licence key) ON THE TERMINAL. Detaching now
 would just block on a closed stdin and exit.
+
+(If you have already answered these in another sandbox, you should not be seeing
+this: harvest that sandbox's answers to the host with stage-burp.sh --harvest
+and recreate this one, rather than spending a second activation.)
 
 Re-run it attached to a terminal:
 
     sbx exec -it $(hostname) /home/agent/bin/burp-start.sh
 
 Your licence key is at $DIST/license.key. Answer the prompts once; the answers
-are stored in $STATE/java and survive sbx rm, so every later start is detached
-and silent.
+are stored in $PREFS_ROOT, which belongs to THIS sandbox and dies with it -- run
+stage-burp.sh --harvest on the host afterwards to keep them.
 EOF
         exit 1
     fi
@@ -342,10 +414,7 @@ EOF
     # Process substitution keeps the log without putting exec in a pipeline, so
     # this really is the last thing the script does.
     exec > >(tee -a "$LOG") 2>&1
-    exec "${BURP[@]}" \
-        --project-file="$STATE/project.burp" \
-        --config-file="$STATE/project-config.json" \
-        --user-config-file="$STATE/user-config.json"
+    exec "${BURP[@]}" --user-config-file="$STATE/user-config.json"
 fi
 
 # --- 7. Launch detached ---------------------------------------------------
@@ -360,10 +429,21 @@ fi
 # No --use-defaults: it means "ignore saved configuration", which would discard
 # the very files seeded above.  No --unpause-spider-and-scanner: auto-starting a
 # scanner whose targets an LLM chooses is not a shippable default.
+# NO --project-file, AND THAT IS DELIBERATE.  Passing one made this script
+# decide, on your behalf and identically for every sandbox, which project Burp
+# opened -- and because it named a path on a shared mount, every sandbox opened
+# the SAME project and inherited the previous engagement's proxy history.
+#
+# Which project to open is a per-sandbox decision and it is yours: without the
+# flag Burp shows its own project dialog on the desktop -- temporary project,
+# new project on disk, or open an existing one -- and waits there until you
+# choose.  Step 8 below expects that wait rather than treating it as a failure.
+#
+# --config-file goes with it, for the same reason: a project configuration
+# applies to a project this script no longer picks.  It is still rendered (step
+# 5) and you can select it in that dialog.
 echo "[burp-start] launching Burp (log: $LOG)"
 setsid nohup "${BURP[@]}" \
-    --project-file="$STATE/project.burp" \
-    --config-file="$STATE/project-config.json" \
     --user-config-file="$STATE/user-config.json" \
     >>"$LOG" 2>&1 &
 
@@ -375,13 +455,29 @@ setsid nohup "${BURP[@]}" \
 # sat for the full 120 seconds before reporting a failure that had not
 # happened. The proxy is what this script owns; the MCP side gets a bounded,
 # advisory probe below, and burp-mcp.sh waits again at the point it matters.
+# A TIMEOUT HERE IS NOT NECESSARILY A FAILURE ANY MORE.  With no --project-file
+# Burp binds nothing until you pick a project in its dialog, so the proxy can
+# legitimately stay shut for as long as it takes you to walk to the desktop.
+# Distinguishing "the JVM died" from "the JVM is waiting for you" is the whole
+# job of this step: the first is an error, the second is the normal path.
+echo "[burp-start] Burp is asking which project to open -- choose one on the desktop:"
+echo "[burp-start]   $("$HOME/bin/desktopctl" url 2>/dev/null || echo '~/bin/desktopctl url')"
+echo "[burp-start] (a temporary project is the right answer unless you want this"
+echo "[burp-start]  engagement's history on disk; it is this sandbox's disk either way)"
 for _ in $(seq 1 120); do
     port_open "$PROXY_PORT" && break
     sleep 1
 done
 
 if ! port_open "$PROXY_PORT"; then
-    echo "burp-start: proxy port $PROXY_PORT never opened. Last 20 lines of $LOG:" >&2
+    if pgrep -f '[b]urpsuite_pro\.jar|[B]urpSuite|[b]urp-install' >/dev/null; then
+        echo
+        echo "Burp is running but has not opened the proxy yet -- it is still on the"
+        echo "project dialog. Choose a project on the desktop; the listener binds then."
+        echo "  log: $LOG"
+        exit 0
+    fi
+    echo "burp-start: Burp exited without opening port $PROXY_PORT. Last 20 lines of $LOG:" >&2
     tail -n 20 "$LOG" >&2
     # The generic form of this reads as a crash and sends people to the wrong
     # place, so name it: 137 is the container OOM killer, not a Burp bug.
@@ -436,3 +532,7 @@ echo
 echo "Burp is up.  proxy :$PROXY_PORT   mcp api :$API_PORT   log: $LOG"
 echo "  desktop:  $("$HOME/bin/desktopctl" url 2>/dev/null || echo '~/bin/desktopctl url')"
 echo "  route a command through it:  via-burp curl -sS https://target/"
+echo "  project config to select in Burp's dialog, if you want it:"
+echo "      $STATE/project-config.json"
+echo "  this sandbox's Burp state is local to it and is NOT shared with any other"
+echo "  sandbox; it goes away with \`sbx rm\`."
